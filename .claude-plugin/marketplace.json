@@ -1,0 +1,14 @@
+{
+  "name": "emily-tools",
+  "owner": {
+    "name": "Emily Laguna"
+  },
+  "description": "Emily's Tools",
+  "version": "0.1",
+  "plugins": [
+    {
+      "name": "emily",
+      "source": "./emily"
+    }
+  ]
+}
