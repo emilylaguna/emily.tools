@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# watch-remind — fire a one-shot reminder at a target time. Polls the
+# current clock and emits a single event when the target is reached,
+# then exits 1 to stop the watch. Works in any Claude Code session
+# because it only depends on the Monitor tool (not CronCreate, which
+# isn't available to all agents).
+#
+# Usage (via harness):
+#   watch watch-remind <interval> <target-epoch> <message...>
+#
+# <target-epoch> is absolute seconds-since-1970 in UTC. The skill
+# computes this from the user's phrasing so this script stays dumb
+# (no timezone parsing, no relative-time guessing).
+#
+# Event format:
+#   remind:fire at=<iso-local> :: <message>
+#
+# If the target time is already in the past, fires immediately. Exit 1
+# on fire stops the harness loop.
+#
+set -uo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: watch-remind <target-epoch> <message...>" >&2
+  exit 64
+fi
+
+target_epoch="$1"
+shift
+message="$*"
+
+if ! [[ "$target_epoch" =~ ^[0-9]+$ ]]; then
+  echo "watch-remind: target-epoch must be an integer (seconds since 1970), got: $target_epoch" >&2
+  exit 64
+fi
+
+now_epoch=$(date +%s)
+
+if [ "$now_epoch" -ge "$target_epoch" ]; then
+  # macOS: `date -r <epoch>`; Linux: `date -d @<epoch>`. Try both.
+  if target_iso=$(date -r "$target_epoch" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null); then
+    :
+  elif target_iso=$(date -d "@$target_epoch" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null); then
+    :
+  else
+    target_iso="$target_epoch"
+  fi
+  echo "remind:fire at=${target_iso} :: ${message}"
+  exit 1
+fi
+
+exit 0

@@ -1,71 +1,101 @@
 ---
 name: remind
-description: Set a one-shot or recurring time-based reminder. Trigger when the user says "remind me at/in/every ...", "in 10 minutes tell me ...", "every weekday at 9am remind me to ...". Uses the `CronCreate` tool (NOT the Monitor tool — reminders are cron events, not polling watches).
+description: Set a one-shot or recurring time-based reminder. Trigger when the user says "remind me at/in/every ...", "in 10 minutes tell me ...", "every weekday at 9am remind me to ...". Defaults to the Monitor tool via watch-remind (available in every session). Falls back to CronCreate only for recurring reminders where that tool is available.
 argument-hint: '<when> <what>'
 ---
 
 # /remind
 
-Schedule a reminder using the `CronCreate` tool. This skill does NOT use `watch` or `Monitor` — reminders are time-based events, not polling watches.
+Schedule a reminder. Default primitive is **Monitor + watch-remind** because Monitor is available in every Claude Code session (including subagents, where CronCreate is typically NOT available). Only reach for CronCreate for recurring reminders when it's in the session's toolset.
 
-## Picking the mode
+## Picking the primitive
 
 Look at the phrasing:
 
-- **One-shot** ("remind me at 3pm", "in 20 minutes", "tomorrow morning") → `CronCreate` with `recurring: false`. Pin the exact minute/hour/DoM/month based on the target time in the user's local timezone.
-- **Recurring** ("every weekday at 9am", "hourly", "every Monday") → `CronCreate` with `recurring: true`. Tell the user about the 7-day auto-expiry on recurring jobs, and set `durable: true` only if they ask for it to survive restarts.
+- **One-shot** ("remind me at 3pm", "in 20 minutes", "tomorrow morning") → **Monitor + watch-remind**. Always works.
+- **Recurring** ("every weekday at 9am", "hourly", "every Monday") → try `CronCreate` with `recurring: true` first. If it's not in your tool list, tell the user: "I can't schedule a recurring job in this session — the `CronCreate` tool isn't loaded. I can set up today's reminder as a one-shot, or you'll need a calendar entry." Do NOT try to fake recurring via Monitor (a watch can't outlive the session).
 
-## Cron expression rules
+## One-shot via watch-remind (primary path)
 
-5 fields: `minute hour day-of-month month day-of-week`, all in the user's local timezone. No timezone conversion.
+### Step 1: Compute the target epoch
 
-**Avoid :00 and :30 minute marks** unless the user names that exact time. Every "remind me at 9am" request landing on `0 9` puts load spikes on the same instant across the fleet. Nudge the minute:
+Run a bash command to turn the user's phrasing into absolute seconds-since-1970. Handle the three common cases:
 
+**Absolute time today** ("at 3pm", "at 12:50"):
+```bash
+date -v15H -v0M -v0S +%s      # macOS: 3:00pm today
+# or: date -v12H -v50M -v0S +%s  # 12:50 today
+```
+If that time has already passed today, either tell the user and ask about tomorrow, or add 86400 seconds to push to the next day — don't silently schedule in the past.
+
+**Relative offset** ("in 10 minutes", "in 2 hours"):
+```bash
+date -v+10M +%s      # macOS
+date -d "+10 minutes" +%s   # GNU (Linux)
+```
+
+**Named day + time** ("tomorrow at 8am", "Friday at 5pm"):
+```bash
+date -v+1d -v8H -v0M -v0S +%s   # tomorrow 8am on macOS
+date -d "tomorrow 08:00" +%s    # GNU
+```
+
+Store the result as `TARGET_EPOCH`.
+
+### Step 2: Pick a polling interval
+
+- Target within **5 minutes** → `interval=5` (second-accurate)
+- Target within **1 hour** → `interval=15`
+- Target hours or days out → `interval=30` (30 seconds is enough; the script only fires once, overhead is minimal)
+
+### Step 3: Invoke Monitor
+
+```
+command:     watch watch-remind <interval> <TARGET_EPOCH> <message>
+description: remind:<short-summary>
+persistent:  true
+```
+
+Example — "remind me at 12:50pm that I have a meeting at 1pm":
+```
+TARGET_EPOCH=$(date -v12H -v50M -v0S +%s)
+# command becomes:
+watch watch-remind 5 1745423400 "Meeting at 1pm"
+description: remind:12:50 meeting
+persistent: true
+```
+
+### Step 4: Route the event
+
+When `remind:fire at=<iso> :: <message>` lands in your Monitor events, **always** send a `PushNotification` with the message. That's the whole point.
+
+The harness auto-stops (exit 1 from the script) once the reminder fires — no `TaskStop` needed.
+
+## Recurring via CronCreate (if available)
+
+If `CronCreate` IS in your tool list, use it for recurring reminders:
+
+5 fields: `minute hour day-of-month month day-of-week`, user's local timezone.
+
+**Avoid :00 and :30 minute marks** unless the user named that exact time. Every "remind me at 9am" request landing on `0 9` clusters requests. Nudge off:
 - "at 9am" → `3 9 * * *` or `57 8 * * *`
 - "hourly" → `7 * * * *`
 - "every morning" → `57 8 * * *`
 
-Only use minute 0 or 30 when the user names that exact time ("at 9:00 sharp", "at half past the hour").
+Set `recurring: true`, and `durable: true` only if the user explicitly wants it to survive restarts. Tell them recurring jobs auto-expire after 7 days.
 
-## Notification shape
+The `prompt` you schedule should tell the next Charlie-turn to send a `PushNotification` with the reminder text.
 
-The `prompt` you schedule should tell the next Charlie-turn what to do. Two patterns:
-
-- **Passive reminder** (user wants to see the text): `prompt` tells Charlie to send a `PushNotification` with the reminder text.
-- **Active task** ("at 5pm deploy the release"): `prompt` describes the action — but unless the user said so explicitly, default to passive reminders. Do not schedule destructive actions unattended without confirmation.
-
-## Examples
-
-User says "remind me at 3pm to leave work":
-
-```
-cron:       3 15 <today_dom> <today_month> *
-recurring:  false
-prompt:     "Send a PushNotification: 'Time to leave work.'"
-```
-
-User says "every weekday at 9am remind me to stretch":
-
+Example — "every weekday at 9am remind me to stretch":
 ```
 cron:       57 8 * * 1-5
 recurring:  true
 prompt:     "Send a PushNotification: 'Stretch break.'"
 ```
 
-Tell them: "I'll nudge you weekdays around 9am. These jobs auto-expire after 7 days — ping me to renew."
+## What NOT to do
 
-User says "in 10 minutes tell me to check the deploy":
-
-```
-cron:       <current_minute+10> <current_hour> <today_dom> <today_month> *
-recurring:  false
-prompt:     "Send a PushNotification: 'Check the deploy.'"
-```
-
-(If 10 minutes crosses an hour boundary, bump the hour field accordingly.)
-
-## What NOT to use
-
-- **Don't use `Monitor`** for reminders. Monitor is for polling "has X changed?" — reminders fire at a pinned time, there's nothing to poll.
-- **Don't use `watch:cmd date +%H%M`** or similar hacks. `CronCreate` is the right primitive.
-- **Don't use `ScheduleWakeup`** — that's `/loop dynamic` mode, not scheduled reminders.
+- **Don't** try `CronCreate` for one-shots when `watch-remind` is sufficient — Monitor is universally available, CronCreate isn't.
+- **Don't** silently schedule in the past if the user's target time has already passed today. Ask.
+- **Don't** hack recurring reminders via Monitor — the harness dies when the session ends, so "every weekday" won't survive overnight. If CronCreate isn't available, say so and offer one-shots or a calendar entry.
+- **Don't** use `ScheduleWakeup` — that's `/loop dynamic` mode only.
