@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# watch-prs — poll a GitHub repo for newly-opened PRs. Emits one line
+# per new PR on stdout. Runs forever (no auto-stop) unless the user
+# cancels via TaskStop.
+#
+# Usage:
+#   watch watch-prs <interval> <owner/repo> [--state open|all]
+#
+# ── Event format ────────────────────────────────────────────────────────
+#
+#   prs:opened <owner>/<repo>#<pr> by=<author> :: <title>
+#   prs:closed <owner>/<repo>#<pr>        # (only if --state all)
+#   prs:merged <owner>/<repo>#<pr>        # (only if --state all)
+#
+# Cold boot: silent seed. Warm boot: emits deltas including PRs opened
+# since last run — this is the "day-1-baseline / day-2-alert" pattern.
+#
+set -uo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: watch-prs <owner/repo> [--state open|all]" >&2
+  exit 64
+fi
+
+repo="$1"
+shift
+state_filter="open"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --state) state_filter="$2"; shift 2 ;;
+    *) echo "watch-prs: unknown arg: $1" >&2; exit 64 ;;
+  esac
+done
+
+: "${WATCH_STATE_DIR:?WATCH_STATE_DIR not set — invoke via the watch harness}"
+
+for cmd in gh jq; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "watch-prs: missing $cmd" >&2; exit 2; }
+done
+
+state_file="$WATCH_STATE_DIR/state.json"
+[ -f "$state_file" ] || echo '{"prs": {}}' > "$state_file"
+is_cold_boot="${WATCH_COLD_BOOT:-0}"
+
+prs_json=$(gh pr list --repo "$repo" --state "$state_filter" --limit 200 \
+  --json number,title,author,state 2>/dev/null) || {
+  echo "watch-prs: failed to list PRs for ${repo}" >&2
+  exit 2
+}
+
+# Normalize: map of id → {state}
+prev_map=$(jq '.prs' "$state_file")
+
+if [ "$is_cold_boot" -eq 0 ]; then
+  echo "$prs_json" | jq -c '.[]' | while read -r pr; do
+    num=$(echo "$pr" | jq -r '.number')
+    state=$(echo "$pr" | jq -r '.state')
+    title=$(echo "$pr" | jq -r '.title' | tr '\r\n' '  ' | sed 's/  */ /g' | cut -c1-180)
+    author=$(echo "$pr" | jq -r '.author.login')
+    prev_state=$(echo "$prev_map" | jq -r --arg n "$num" '.[$n] // empty')
+
+    if [ -z "$prev_state" ]; then
+      echo "prs:opened ${repo}#${num} by=${author} :: ${title}"
+    elif [ "$state" != "$prev_state" ]; then
+      case "$state" in
+        MERGED) echo "prs:merged ${repo}#${num}" ;;
+        CLOSED) echo "prs:closed ${repo}#${num}" ;;
+      esac
+    fi
+  done
+fi
+
+# Persist new snapshot
+new_map=$(echo "$prs_json" | jq 'map({(.number | tostring): .state}) | add // {}')
+jq -n --argjson prs "$new_map" '{prs: $prs}' > "$state_file"
+
+exit 0

@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# watch-folder — poll a folder recursively for file adds/modifies/deletes.
+# Maintains a manifest of (path, mtime, size) per file.
+#
+# Usage:
+#   watch watch-folder <interval> <path> [--glob '<pattern>']
+#
+# ── Event format ────────────────────────────────────────────────────────
+#
+#   folder:added    <abs-path> size=<bytes>
+#   folder:modified <abs-path> size=<bytes>
+#   folder:deleted  <abs-path>
+#
+# Notes:
+# - Hidden files (.git, .DS_Store) are skipped by default.
+# - Output capped at 200 events per iteration to avoid notification floods
+#   on big bulk changes; further events print "folder:truncated N more"
+#   and are picked up next iteration.
+#
+set -uo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: watch-folder <path> [--glob '<pattern>']" >&2
+  exit 64
+fi
+
+root="$1"
+shift
+glob=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --glob) glob="$2"; shift 2 ;;
+    *) echo "watch-folder: unknown arg: $1" >&2; exit 64 ;;
+  esac
+done
+
+if [ ! -d "$root" ]; then
+  echo "watch-folder: not a directory: $root" >&2
+  exit 2
+fi
+
+abs_root=$(cd "$root" && pwd)
+
+: "${WATCH_STATE_DIR:?WATCH_STATE_DIR not set — invoke via the watch harness}"
+
+command -v jq >/dev/null 2>&1 || { echo "watch-folder: missing jq" >&2; exit 2; }
+
+state_file="$WATCH_STATE_DIR/manifest.json"
+[ -f "$state_file" ] || echo '{}' > "$state_file"
+is_cold_boot="${WATCH_COLD_BOOT:-0}"
+
+# Build current manifest as tab-separated lines: "<path>\t<mtime>\t<size>"
+build_manifest() {
+  local find_args=(-type f -not -path '*/.*')
+  if [ -n "$glob" ]; then
+    find_args=(-type f -name "$glob" -not -path '*/.*')
+  fi
+  find "$abs_root" "${find_args[@]}" -print0 2>/dev/null | \
+    while IFS= read -r -d '' p; do
+      if [ "$(uname)" = "Darwin" ]; then
+        mt=$(stat -f '%m' "$p" 2>/dev/null) || continue
+        sz=$(stat -f '%z' "$p" 2>/dev/null) || continue
+      else
+        mt=$(stat -c '%Y' "$p" 2>/dev/null) || continue
+        sz=$(stat -c '%s' "$p" 2>/dev/null) || continue
+      fi
+      printf '%s\t%s\t%s\n' "$p" "$mt" "$sz"
+    done
+}
+
+curr_manifest=$(build_manifest)
+
+# Convert to JSON: { "<path>": {"mtime": N, "size": N} }
+curr_json=$(printf '%s\n' "$curr_manifest" | awk -F'\t' '
+  BEGIN { printf "{" }
+  NF>=3 {
+    if (n++) printf ",";
+    gsub(/\\/, "\\\\", $1); gsub(/"/, "\\\"", $1);
+    printf "\"%s\":{\"mtime\":%s,\"size\":%s}", $1, $2, $3
+  }
+  END { printf "}" }
+')
+[ -z "$curr_json" ] && curr_json="{}"
+
+prev_json=$(cat "$state_file")
+
+if [ "$is_cold_boot" -eq 0 ]; then
+  # Compute added / modified / deleted via three independent jq calls.
+  # (Single composite query trips jq's parser on the `-` array-minus
+  # operator when it sits inside an object literal.)
+  added=$(jq -r -n --argjson c "$curr_json" --argjson p "$prev_json" \
+    '($c | keys) as $ck | ($p | keys) as $pk | $ck | map(select(. as $x | $pk | index($x) | not)) | .[]?')
+  deleted=$(jq -r -n --argjson c "$curr_json" --argjson p "$prev_json" \
+    '($c | keys) as $ck | ($p | keys) as $pk | $pk | map(select(. as $x | $ck | index($x) | not)) | .[]?')
+  modified=$(jq -r -n --argjson c "$curr_json" --argjson p "$prev_json" \
+    '$c | keys | map(select(. as $k | ($p[$k] != null) and ($c[$k] != $p[$k]))) | .[]?')
+
+  count=0
+  max=200
+  emit() {
+    if [ "$count" -lt "$max" ]; then
+      echo "$1"
+    fi
+    count=$((count + 1))
+  }
+
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    sz=$(echo "$curr_json" | jq -r --arg k "$p" '.[$k].size')
+    emit "folder:added ${p} size=${sz}"
+  done <<< "$added"
+
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    sz=$(echo "$curr_json" | jq -r --arg k "$p" '.[$k].size')
+    emit "folder:modified ${p} size=${sz}"
+  done <<< "$modified"
+
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    emit "folder:deleted ${p}"
+  done <<< "$deleted"
+
+  if [ "$count" -gt "$max" ]; then
+    echo "folder:truncated $((count - max)) more"
+  fi
+fi
+
+echo "$curr_json" > "$state_file"
+exit 0

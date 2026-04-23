@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# watch-cmd — run an arbitrary shell command, hash its stdout, and emit
+# an event when the output changes. The generic escape hatch for
+# "watch anything you can express as a command."
+#
+# Usage:
+#   watch watch-cmd <interval> '<shell-command-string>'
+#
+# ── Event format ────────────────────────────────────────────────────────
+#
+#   cmd:changed bytes=<n> lines=<n> :: <first-200-chars>
+#   cmd:failed  exit=<code>                  # command non-zero exit
+#
+# Full output for each iteration is saved to $WATCH_STATE_DIR/last_output
+# so callers can diff against it if they need more than the preview.
+#
+set -uo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: watch-cmd '<shell-command>'" >&2
+  exit 64
+fi
+
+cmd_str="$*"
+
+: "${WATCH_STATE_DIR:?WATCH_STATE_DIR not set — invoke via the watch harness}"
+
+command -v jq >/dev/null 2>&1 || { echo "watch-cmd: missing jq" >&2; exit 2; }
+
+state_file="$WATCH_STATE_DIR/state.json"
+last_output="$WATCH_STATE_DIR/last_output"
+[ -f "$state_file" ] || echo '{"hash": ""}' > "$state_file"
+is_cold_boot="${WATCH_COLD_BOOT:-0}"
+
+# Run the command, capture stdout. stderr goes to the script's stderr
+# (which ends up in Monitor's output file, not in notifications).
+tmp_output=$(mktemp "$WATCH_STATE_DIR/out.XXXXXX")
+# shellcheck disable=SC2086
+bash -c "$cmd_str" > "$tmp_output" 2>&1
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+  rm -f "$tmp_output"
+  if [ "$is_cold_boot" -eq 0 ]; then
+    echo "cmd:failed exit=${rc}"
+  fi
+  # Don't update state so a return to success emits cmd:changed.
+  exit 0
+fi
+
+curr_hash=$(shasum -a 256 "$tmp_output" | awk '{print $1}')
+prev_hash=$(jq -r '.hash' "$state_file")
+
+if [ "$is_cold_boot" -eq 0 ] && [ "$curr_hash" != "$prev_hash" ]; then
+  bytes=$(wc -c < "$tmp_output" | tr -d ' ')
+  lines=$(wc -l < "$tmp_output" | tr -d ' ')
+  preview=$(head -c 200 "$tmp_output" | tr '\r\n' '  ' | sed 's/  */ /g')
+  echo "cmd:changed bytes=${bytes} lines=${lines} :: ${preview}"
+fi
+
+mv "$tmp_output" "$last_output"
+jq -n --arg h "$curr_hash" '{hash: $h}' > "$state_file"
+exit 0

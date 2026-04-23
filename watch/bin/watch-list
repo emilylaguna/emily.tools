@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# watch-list — list all persisted watch state dirs with metadata.
+#
+# Usage:
+#   watch-list              # table of all watches
+#   watch-list --json       # one JSON object per line
+#
+set -uo pipefail
+
+: "${CLAUDE_PLUGIN_DATA:?CLAUDE_PLUGIN_DATA not set}"
+
+root="${CLAUDE_PLUGIN_DATA}/watches"
+if [ ! -d "$root" ]; then
+  echo "no watches" >&2
+  exit 0
+fi
+
+mode="table"
+if [ "${1:-}" = "--json" ]; then
+  mode="json"
+fi
+
+found=0
+for dir in "$root"/*/; do
+  [ -d "$dir" ] || continue
+  meta="$dir/_meta.json"
+  [ -f "$meta" ] || continue
+  found=1
+  if [ "$mode" = "json" ]; then
+    cat "$meta"
+    echo
+  else
+    id=$(jq -r '.id' "$meta")
+    child=$(jq -r '.child' "$meta")
+    args=$(jq -r '.args | join(" ")' "$meta")
+    interval=$(jq -r '.interval' "$meta")
+    started=$(jq -r '.last_started' "$meta")
+    printf '%-40s  every %4ss  last-run %s\n  %s %s\n\n' \
+      "$id" "$interval" "$started" "$child" "$args"
+  fi
+done
+
+if [ "$found" -eq 0 ] && [ "$mode" = "table" ]; then
+  echo "no watches"
+fi

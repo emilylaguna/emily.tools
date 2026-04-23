@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# watch-url — poll an HTTP(S) URL for status code changes and body
+# content changes.
+#
+# Usage:
+#   watch watch-url <interval> <url> [--content|--status-only]
+#
+# ── Event format ────────────────────────────────────────────────────────
+#
+#   url:status_changed   <url> <FROM>→<TO>
+#   url:content_changed  <url> bytes=<n>          # (only if --content)
+#   url:unreachable      <url> :: <reason>
+#   url:recovered        <url> status=<code>
+#
+# --content (default) tracks both status code and body hash.
+# --status-only skips body fetching, just HEADs the URL.
+#
+set -uo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: watch-url <url> [--content|--status-only]" >&2
+  exit 64
+fi
+
+url="$1"
+shift
+mode="content"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --content)     mode="content"; shift ;;
+    --status-only) mode="status"; shift ;;
+    *) echo "watch-url: unknown arg: $1" >&2; exit 64 ;;
+  esac
+done
+
+: "${WATCH_STATE_DIR:?WATCH_STATE_DIR not set — invoke via the watch harness}"
+
+for c in curl jq shasum; do
+  command -v "$c" >/dev/null 2>&1 || { echo "watch-url: missing $c" >&2; exit 2; }
+done
+
+state_file="$WATCH_STATE_DIR/state.json"
+[ -f "$state_file" ] || echo '{"status": 0, "hash": "", "reachable": true}' > "$state_file"
+is_cold_boot="${WATCH_COLD_BOOT:-0}"
+
+prev_status=$(jq -r '.status' "$state_file")
+prev_hash=$(jq -r '.hash' "$state_file")
+prev_reachable=$(jq -r '.reachable' "$state_file")
+
+body_file=$(mktemp "$WATCH_STATE_DIR/body.XXXXXX")
+
+if [ "$mode" = "status" ]; then
+  status=$(curl -sSI -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null) || status=0
+  hash="$prev_hash"  # not tracked in status-only mode
+else
+  status=$(curl -sSL -o "$body_file" -w '%{http_code}' --max-time 15 "$url" 2>/dev/null) || status=0
+  if [ -f "$body_file" ] && [ "$status" != "0" ]; then
+    hash=$(shasum -a 256 "$body_file" | awk '{print $1}')
+  else
+    hash=""
+  fi
+fi
+
+rm -f "$body_file"
+
+# Reachability: status 000 or curl failure means unreachable.
+reachable=true
+if [ "$status" = "0" ] || [ "$status" = "000" ] || [ -z "$status" ]; then
+  reachable=false
+fi
+
+if [ "$is_cold_boot" -eq 0 ]; then
+  if [ "$reachable" = "false" ] && [ "$prev_reachable" = "true" ]; then
+    echo "url:unreachable ${url} :: status=${status:-timeout}"
+  elif [ "$reachable" = "true" ] && [ "$prev_reachable" = "false" ]; then
+    echo "url:recovered ${url} status=${status}"
+  fi
+
+  if [ "$reachable" = "true" ] && [ "$prev_reachable" = "true" ]; then
+    if [ "$status" != "$prev_status" ]; then
+      echo "url:status_changed ${url} ${prev_status}→${status}"
+    fi
+    if [ "$mode" = "content" ] && [ -n "$hash" ] && [ -n "$prev_hash" ] && [ "$hash" != "$prev_hash" ]; then
+      echo "url:content_changed ${url}"
+    fi
+  fi
+fi
+
+jq -n --argjson s "${status:-0}" --arg h "$hash" --argjson r "$reachable" \
+  '{status: $s, hash: $h, reachable: $r}' > "$state_file"
+
+exit 0

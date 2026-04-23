@@ -1,0 +1,6 @@
+{
+  "name": "watch",
+  "description": "Poll-and-diff watchers over the Monitor tool — PRs, files, folders, commands, URLs, CI runs, git branches — plus /remind.",
+  "author": {"name": "Emily Laguna"},
+  "version": "0.2"
+}

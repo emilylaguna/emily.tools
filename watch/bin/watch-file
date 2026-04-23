@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# watch-file — poll a single file for content changes. Uses content
+# hash (not just mtime) so `touch` without a real edit won't fire.
+#
+# Usage:
+#   watch watch-file <interval> <path>
+#
+# ── Event format ────────────────────────────────────────────────────────
+#
+#   file:modified <abs-path> size=<bytes>
+#   file:deleted  <abs-path>    # emits then exits (exit 1)
+#   file:created  <abs-path> size=<bytes>    # warm boot only, file came back
+#
+set -uo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: watch-file <path>" >&2
+  exit 64
+fi
+
+path="$1"
+
+# Resolve to absolute path for stable state identity.
+if [ -e "$path" ]; then
+  abs=$(cd "$(dirname "$path")" && pwd)/$(basename "$path")
+else
+  # Use as-given; parent dir may not exist yet.
+  abs="$path"
+fi
+
+: "${WATCH_STATE_DIR:?WATCH_STATE_DIR not set — invoke via the watch harness}"
+
+command -v jq >/dev/null 2>&1 || { echo "watch-file: missing jq" >&2; exit 2; }
+
+state_file="$WATCH_STATE_DIR/state.json"
+[ -f "$state_file" ] || echo '{"exists": false, "hash": "", "size": 0}' > "$state_file"
+is_cold_boot="${WATCH_COLD_BOOT:-0}"
+
+prev_exists=$(jq -r '.exists' "$state_file")
+prev_hash=$(jq -r '.hash' "$state_file")
+
+if [ -f "$abs" ]; then
+  curr_size=$(wc -c < "$abs" | tr -d ' ')
+  curr_hash=$(shasum -a 256 "$abs" | awk '{print $1}')
+  if [ "$is_cold_boot" -eq 0 ]; then
+    if [ "$prev_exists" = "false" ]; then
+      echo "file:created ${abs} size=${curr_size}"
+    elif [ "$curr_hash" != "$prev_hash" ]; then
+      echo "file:modified ${abs} size=${curr_size}"
+    fi
+  fi
+  jq -n --arg h "$curr_hash" --argjson s "$curr_size" \
+    '{exists: true, hash: $h, size: $s}' > "$state_file"
+  exit 0
+else
+  if [ "$is_cold_boot" -eq 0 ] && [ "$prev_exists" = "true" ]; then
+    echo "file:deleted ${abs}"
+  fi
+  jq -n '{exists: false, hash: "", size: 0}' > "$state_file"
+  # File missing on cold boot: keep watching (user may be waiting for
+  # it to be created). If it was present and got deleted, stop.
+  if [ "$prev_exists" = "true" ]; then
+    exit 1
+  fi
+  exit 0
+fi

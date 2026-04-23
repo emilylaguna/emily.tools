@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# watch-pr — poll a single GitHub PR for new comments, reviews, and
+# check-run status changes. Emits one tagged log line per event on
+# stdout. Stops (exit 1) when the PR closes or merges.
+#
+# Usage (via harness):
+#   watch watch-pr <interval> <owner/repo> <pr-number>
+#
+# Direct usage (for testing):
+#   WATCH_STATE_DIR=/tmp/wpr WATCH_COLD_BOOT=1 watch-pr <owner/repo> <pr>
+#
+# Requires: gh, jq
+#
+# ── Event format ────────────────────────────────────────────────────────
+#
+# One line per event. Leading tag is "pr:<event_type>" so Charlie can
+# regex-route. Remaining fields are space-separated; a free-text tail
+# (comment body, review body) is prefixed with " :: " so it's trivial
+# to split. Newlines in tails are normalized to single spaces.
+#
+#   pr:comment_added        <owner>/<repo>#<pr> by=<user> :: <body>
+#   pr:inline_comment_added <owner>/<repo>#<pr> by=<user> file=<path>:<line> [reply_to=<id>] :: <body>
+#   pr:review_submitted     <owner>/<repo>#<pr> by=<user> state=<state> :: <body>
+#       # state ∈ APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED
+#   pr:check_changed        <owner>/<repo>#<pr> check=<name> <from>→<to>
+#   pr:merged               <owner>/<repo>#<pr>
+#   pr:closed               <owner>/<repo>#<pr>
+#
+# "comment_added" = top-level PR discussion (/issues/<pr>/comments).
+# "inline_comment_added" = diff-attached review comments (/pulls/<pr>/comments).
+# The two live in separate ID namespaces and must be tracked separately.
+#
+# Guidance on which events deserve a PushNotification lives in the skill
+# doc — the script is dumb, Charlie decides.
+#
+set -uo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: watch-pr <owner/repo> <pr-number>" >&2
+  exit 64
+fi
+
+repo="$1"
+pr="$2"
+ref="${repo}#${pr}"
+
+: "${WATCH_STATE_DIR:?WATCH_STATE_DIR not set — invoke via the watch harness}"
+
+for cmd in gh jq; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "watch-pr: missing dependency: $cmd" >&2
+    exit 2
+  fi
+done
+
+state_file="$WATCH_STATE_DIR/state.json"
+if [ ! -f "$state_file" ]; then
+  echo '{"comments": {}, "inline_comments": {}, "reviews": {}, "checks": {}, "pr_state": "OPEN"}' > "$state_file"
+fi
+
+is_cold_boot="${WATCH_COLD_BOOT:-0}"
+
+# normalize: collapse newlines/CRs to spaces, trim, truncate to 200 chars
+normalize_tail() {
+  local s="$1"
+  s=$(printf '%s' "$s" | tr '\r\n' '  ' | sed 's/  */ /g' | sed 's/^ //;s/ $//')
+  if [ "${#s}" -gt 200 ]; then
+    s="${s:0:197}..."
+  fi
+  printf '%s' "$s"
+}
+
+# --- Fetch current snapshot -------------------------------------------------
+
+comments_json=$(gh api "repos/${repo}/issues/${pr}/comments" \
+  --jq '[.[] | {id: (.id | tostring), user: .user.login, body, created_at}]' 2>/dev/null) || {
+  echo "watch-pr: failed to fetch comments for ${ref}" >&2
+  exit 2
+}
+
+inline_comments_json=$(gh api "repos/${repo}/pulls/${pr}/comments" \
+  --jq '[.[] | {id: (.id | tostring), user: .user.login, path, line, body, created_at, in_reply_to_id}]' 2>/dev/null) || {
+  echo "watch-pr: failed to fetch inline comments for ${ref}" >&2
+  exit 2
+}
+
+reviews_json=$(gh api "repos/${repo}/pulls/${pr}/reviews" \
+  --jq '[.[] | select(.state != "PENDING") | {id: (.id | tostring), user: .user.login, state, body, submitted_at}]' 2>/dev/null) || {
+  echo "watch-pr: failed to fetch reviews for ${ref}" >&2
+  exit 2
+}
+
+checks_json=$(gh pr checks "$pr" --repo "$repo" --json name,state 2>/dev/null) || {
+  checks_json="[]"
+}
+
+pr_state=$(gh pr view "$pr" --repo "$repo" --json state --jq .state 2>/dev/null) || {
+  echo "watch-pr: failed to fetch PR state for ${ref}" >&2
+  exit 2
+}
+
+# --- Diff against prior state -----------------------------------------------
+
+prev_comment_ids=$(jq -r '.comments | keys[]' "$state_file" 2>/dev/null || true)
+prev_inline_ids=$(jq -r '.inline_comments | keys[]' "$state_file" 2>/dev/null || true)
+prev_review_ids=$(jq -r '.reviews | keys[]' "$state_file" 2>/dev/null || true)
+prev_checks=$(jq -c '.checks' "$state_file")
+prev_pr_state=$(jq -r '.pr_state' "$state_file")
+
+if [ "$is_cold_boot" -eq 0 ]; then
+  # New top-level comments
+  echo "$comments_json" | jq -c '.[]' | while read -r c; do
+    id=$(echo "$c" | jq -r '.id')
+    if ! grep -qx "$id" <<< "$prev_comment_ids"; then
+      user=$(echo "$c" | jq -r '.user')
+      body=$(normalize_tail "$(echo "$c" | jq -r '.body // ""')")
+      echo "pr:comment_added ${ref} by=${user} :: ${body}"
+    fi
+  done
+
+  # New inline (diff-attached) comments
+  echo "$inline_comments_json" | jq -c '.[]' | while read -r c; do
+    id=$(echo "$c" | jq -r '.id')
+    if ! grep -qx "$id" <<< "$prev_inline_ids"; then
+      user=$(echo "$c" | jq -r '.user')
+      path=$(echo "$c" | jq -r '.path')
+      line=$(echo "$c" | jq -r '.line // "?"')
+      reply_to=$(echo "$c" | jq -r '.in_reply_to_id // empty')
+      body=$(normalize_tail "$(echo "$c" | jq -r '.body // ""')")
+      if [ -n "$reply_to" ]; then
+        echo "pr:inline_comment_added ${ref} by=${user} file=${path}:${line} reply_to=${reply_to} :: ${body}"
+      else
+        echo "pr:inline_comment_added ${ref} by=${user} file=${path}:${line} :: ${body}"
+      fi
+    fi
+  done
+
+  # New reviews
+  echo "$reviews_json" | jq -c '.[]' | while read -r r; do
+    id=$(echo "$r" | jq -r '.id')
+    if ! grep -qx "$id" <<< "$prev_review_ids"; then
+      user=$(echo "$r" | jq -r '.user')
+      state=$(echo "$r" | jq -r '.state')
+      body=$(normalize_tail "$(echo "$r" | jq -r '.body // ""')")
+      echo "pr:review_submitted ${ref} by=${user} state=${state} :: ${body}"
+    fi
+  done
+
+  # Check-run state flips
+  echo "$checks_json" | jq -c '.[]' | while read -r check; do
+    name=$(echo "$check" | jq -r '.name')
+    state=$(echo "$check" | jq -r '.state')
+    prev_state=$(echo "$prev_checks" | jq -r --arg n "$name" '.[$n] // empty')
+    if [ "$state" != "$prev_state" ] && [ -n "$prev_state" ]; then
+      echo "pr:check_changed ${ref} check=${name} ${prev_state}→${state}"
+    fi
+  done
+fi
+
+# PR close/merge. Cold boot: only emit if already non-open. Warm boot:
+# emit on actual state change.
+should_emit_pr_state_event=0
+if [ "$is_cold_boot" -eq 1 ] && [ "$pr_state" != "OPEN" ]; then
+  should_emit_pr_state_event=1
+fi
+if [ "$is_cold_boot" -eq 0 ] && [ "$pr_state" != "$prev_pr_state" ]; then
+  should_emit_pr_state_event=1
+fi
+
+if [ "$should_emit_pr_state_event" -eq 1 ]; then
+  case "$pr_state" in
+    MERGED) echo "pr:merged ${ref}" ;;
+    CLOSED) echo "pr:closed ${ref}" ;;
+  esac
+fi
+
+# --- Persist new snapshot ---------------------------------------------------
+
+new_comments_map=$(echo "$comments_json" | jq 'map({(.id): .}) | add // {}')
+new_inline_map=$(echo "$inline_comments_json" | jq 'map({(.id): .}) | add // {}')
+new_reviews_map=$(echo "$reviews_json" | jq 'map({(.id): .}) | add // {}')
+new_checks_map=$(echo "$checks_json" | jq 'map({(.name): .state}) | add // {}')
+
+jq -n \
+  --argjson comments "$new_comments_map" \
+  --argjson inline_comments "$new_inline_map" \
+  --argjson reviews "$new_reviews_map" \
+  --argjson checks "$new_checks_map" \
+  --arg pr_state "$pr_state" \
+  '{comments: $comments, inline_comments: $inline_comments, reviews: $reviews, checks: $checks, pr_state: $pr_state}' \
+  > "$state_file"
+
+# --- Stop condition ---------------------------------------------------------
+
+if [ "$pr_state" != "OPEN" ]; then
+  exit 1
+fi
+
+exit 0

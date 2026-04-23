@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# watch-ci — watch a GitHub Actions workflow run until it completes.
+# Emits status transitions along the way and a final event with the
+# conclusion. Exits 1 once the run reaches a terminal state.
+#
+# Usage:
+#   watch watch-ci <interval> <owner/repo> <run-id>
+#
+# To find the latest run for a branch:
+#   gh run list --repo <repo> --branch <branch> --limit 1 --json databaseId
+#
+# ── Event format ────────────────────────────────────────────────────────
+#
+#   ci:status_changed <repo> run=<id> <FROM>→<TO>
+#   ci:completed      <repo> run=<id> conclusion=<success|failure|cancelled|...>
+#
+# status values: queued | in_progress | completed
+# conclusion values (only when status=completed):
+#   success | failure | cancelled | skipped | timed_out | action_required | neutral | stale
+#
+set -uo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: watch-ci <owner/repo> <run-id>" >&2
+  exit 64
+fi
+
+repo="$1"
+run_id="$2"
+
+: "${WATCH_STATE_DIR:?WATCH_STATE_DIR not set — invoke via the watch harness}"
+
+for c in gh jq; do
+  command -v "$c" >/dev/null 2>&1 || { echo "watch-ci: missing $c" >&2; exit 2; }
+done
+
+state_file="$WATCH_STATE_DIR/state.json"
+[ -f "$state_file" ] || echo '{"status": "", "conclusion": ""}' > "$state_file"
+is_cold_boot="${WATCH_COLD_BOOT:-0}"
+
+run_json=$(gh run view "$run_id" --repo "$repo" --json status,conclusion 2>/dev/null) || {
+  echo "watch-ci: failed to fetch run ${run_id} in ${repo}" >&2
+  exit 2
+}
+
+status=$(echo "$run_json" | jq -r '.status')
+conclusion=$(echo "$run_json" | jq -r '.conclusion')
+
+prev_status=$(jq -r '.status' "$state_file")
+
+if [ "$is_cold_boot" -eq 0 ] && [ -n "$prev_status" ] && [ "$status" != "$prev_status" ]; then
+  echo "ci:status_changed ${repo} run=${run_id} ${prev_status}→${status}"
+fi
+
+jq -n --arg s "$status" --arg c "$conclusion" \
+  '{status: $s, conclusion: $c}' > "$state_file"
+
+if [ "$status" = "completed" ]; then
+  echo "ci:completed ${repo} run=${run_id} conclusion=${conclusion}"
+  exit 1
+fi
+
+exit 0

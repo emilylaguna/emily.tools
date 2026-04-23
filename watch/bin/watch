@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# watch — generic watch harness for the /watch plugin.
+#
+# Wraps a polling script in a loop, gives it a PERSISTENT state dir
+# keyed by the watch's identity (child cmd + args), and streams events
+# to stdout (one line per event). Designed to be invoked via Claude
+# Code's Monitor tool.
+#
+# State persists across invocations and sessions — stopping and
+# restarting the same watch tomorrow picks up where it left off.
+# Use `watch-clear <id|--all>` to reset.
+#
+# Usage:
+#   watch <child-cmd> <interval-seconds> [args...]
+#
+# <child-cmd> must be on PATH. The plugin's bin/ dir is on PATH
+# automatically, so sibling commands like `watch-pr`, `watch-file`,
+# etc. resolve by bare name.
+#
+# The child receives:
+#   $WATCH_STATE_DIR   persistent dir for its own state files
+#   $WATCH_ITERATION   1-based iteration counter within THIS invocation
+#   $WATCH_COLD_BOOT   1 if state dir did not exist before this run, else 0
+#   $WATCH_ID          stable identity hash (same args → same id)
+#   $@                 whatever args followed <interval>
+#
+# Child contract:
+#   stdout         each line becomes a Monitor event
+#   stderr         diagnostics (output file only, not a notification)
+#   exit 0         continue — sleep, then run again
+#   exit 1         done — harness exits success, watch ends
+#   exit 2         error — harness logs, keeps watching
+#   other          unexpected — logged, keeps watching
+#
+# Env:
+#   CLAUDE_PLUGIN_DATA   persistent plugin dir; state lives here
+#   WATCH_ID             optional override for the identity hash
+#
+set -uo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: watch <child-cmd> <interval-seconds> [args...]" >&2
+  exit 64
+fi
+
+child="$1"
+interval="$2"
+shift 2
+
+if ! command -v "$child" >/dev/null 2>&1; then
+  echo "watch: child command not on PATH: $child" >&2
+  exit 66
+fi
+
+if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
+  echo "watch: interval must be a positive integer (seconds), got: $interval" >&2
+  exit 64
+fi
+
+: "${CLAUDE_PLUGIN_DATA:?CLAUDE_PLUGIN_DATA not set — watch must run under a plugin runtime}"
+
+# Stable watch identity: hash of the child command + its args. Same
+# invocation shape → same state dir across sessions. User can override
+# with WATCH_ID in env if they want named watches.
+if [ -z "${WATCH_ID:-}" ]; then
+  id_input="$child"
+  for a in "$@"; do id_input+=$'\x1f'"$a"; done
+  # sha256 -> short hash for directory-friendly names
+  hash=$(printf '%s' "$id_input" | shasum -a 256 | awk '{print $1}' | cut -c1-16)
+  WATCH_ID="${child}-${hash}"
+fi
+
+state_dir="${CLAUDE_PLUGIN_DATA}/watches/${WATCH_ID}"
+
+# Record cold-boot state BEFORE mkdir so children see the real signal.
+if [ -d "$state_dir" ]; then
+  cold_boot=0
+else
+  cold_boot=1
+fi
+mkdir -p "$state_dir"
+
+# Record the watch invocation for `watch-list`.
+meta_file="$state_dir/_meta.json"
+printf '{"child":%s,"args":%s,"interval":%s,"last_started":"%s","id":"%s"}\n' \
+  "$(printf '%s' "$child" | jq -Rs .)" \
+  "$(printf '%s\n' "$@" | jq -Rn '[inputs]')" \
+  "$interval" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "$WATCH_ID" \
+  > "$meta_file"
+
+iteration=1
+while true; do
+  # After iteration 1, cold_boot is always 0 for the rest of this
+  # invocation (the state is no longer cold from iter 2 onward).
+  effective_cold=$cold_boot
+  [ "$iteration" -gt 1 ] && effective_cold=0
+
+  WATCH_STATE_DIR="$state_dir" \
+  WATCH_ITERATION="$iteration" \
+  WATCH_COLD_BOOT="$effective_cold" \
+  WATCH_ID="$WATCH_ID" \
+    "$child" "$@"
+  rc=$?
+  case $rc in
+    0) ;;                                                             # continue
+    1) exit 0 ;;                                                       # done
+    2) echo "watch: child reported error (exit 2) on iteration $iteration" >&2 ;;
+    *) echo "watch: unexpected child exit $rc on iteration $iteration" >&2 ;;
+  esac
+  iteration=$((iteration + 1))
+  sleep "$interval"
+done

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# watch-branch — watch a git branch for new commits. Works with local
+# branches (no fetch) or remote branches (fetches first).
+#
+# Usage:
+#   watch watch-branch <interval> <repo-path> <branch> [--remote <remote>]
+#
+# ── Event format ────────────────────────────────────────────────────────
+#
+#   branch:commit <repo>@<branch> sha=<short> by=<author> :: <subject>
+#
+# State tracks the last seen HEAD sha. On warm boot the script walks
+# the new commits in chronological order and emits one event per commit.
+#
+set -uo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "usage: watch-branch <repo-path> <branch> [--remote <remote>]" >&2
+  exit 64
+fi
+
+repo_path="$1"
+branch="$2"
+shift 2
+remote=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remote) remote="$2"; shift 2 ;;
+    *) echo "watch-branch: unknown arg: $1" >&2; exit 64 ;;
+  esac
+done
+
+if [ ! -d "$repo_path/.git" ] && [ ! -f "$repo_path/.git" ]; then
+  echo "watch-branch: not a git repo: $repo_path" >&2
+  exit 2
+fi
+
+command -v jq >/dev/null 2>&1 || { echo "watch-branch: missing jq" >&2; exit 2; }
+
+: "${WATCH_STATE_DIR:?WATCH_STATE_DIR not set — invoke via the watch harness}"
+
+state_file="$WATCH_STATE_DIR/state.json"
+[ -f "$state_file" ] || echo '{"head": ""}' > "$state_file"
+is_cold_boot="${WATCH_COLD_BOOT:-0}"
+
+cd "$repo_path" || { echo "watch-branch: cannot cd to $repo_path" >&2; exit 2; }
+
+# Resolve the ref we're tracking.
+if [ -n "$remote" ]; then
+  git fetch --quiet "$remote" "$branch" 2>/dev/null || {
+    echo "watch-branch: git fetch failed for $remote/$branch" >&2
+    exit 2
+  }
+  ref="refs/remotes/${remote}/${branch}"
+else
+  ref="refs/heads/${branch}"
+fi
+
+if ! git rev-parse --verify "$ref" >/dev/null 2>&1; then
+  echo "watch-branch: no such ref: $ref" >&2
+  exit 2
+fi
+
+curr_head=$(git rev-parse "$ref")
+prev_head=$(jq -r '.head' "$state_file")
+
+repo_name=$(basename "$repo_path")
+
+if [ "$is_cold_boot" -eq 0 ] && [ -n "$prev_head" ] && [ "$curr_head" != "$prev_head" ]; then
+  # List commits between prev_head..curr_head in chronological order.
+  # Format: <short-sha>\t<author>\t<subject>
+  # Use tformat: (not format:) so each commit line ends with \n — otherwise
+  # `while read` drops the final commit.
+  git log --reverse --pretty=tformat:'%h%x09%an%x09%s' "${prev_head}..${curr_head}" | \
+    while IFS=$'\t' read -r sha author subject; do
+      subject=$(echo "$subject" | tr '\r\n' '  ' | sed 's/  */ /g' | cut -c1-160)
+      echo "branch:commit ${repo_name}@${branch} sha=${sha} by=${author} :: ${subject}"
+    done
+fi
+
+jq -n --arg h "$curr_head" '{head: $h}' > "$state_file"
+
+exit 0

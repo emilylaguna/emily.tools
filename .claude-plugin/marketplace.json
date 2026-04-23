@@ -9,6 +9,10 @@
     {
       "name": "emily",
       "source": "./emily"
+    },
+    {
+      "name": "watch",
+      "source": "./watch"
     }
   ]
 }

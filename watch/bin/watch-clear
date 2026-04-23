@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# watch-clear — remove persisted state for one or all watches.
+#
+# Usage:
+#   watch-clear <watch-id>      # clear one watch by id
+#   watch-clear --all           # clear every watch's state
+#   watch-clear --match <substr># clear every watch whose id contains <substr>
+#
+# Use `watch-list` to see ids.
+#
+set -uo pipefail
+
+: "${CLAUDE_PLUGIN_DATA:?CLAUDE_PLUGIN_DATA not set}"
+
+root="${CLAUDE_PLUGIN_DATA}/watches"
+
+if [ $# -lt 1 ]; then
+  echo "usage: watch-clear <watch-id> | --all | --match <substr>" >&2
+  exit 64
+fi
+
+case "$1" in
+  --all)
+    if [ ! -d "$root" ]; then
+      echo "no watches" >&2
+      exit 0
+    fi
+    rm -rf "$root"
+    echo "cleared all watches"
+    ;;
+  --match)
+    substr="${2:?--match requires a substring}"
+    count=0
+    for dir in "$root"/*/; do
+      [ -d "$dir" ] || continue
+      base=$(basename "$dir")
+      case "$base" in
+        *"$substr"*)
+          rm -rf "$dir"
+          echo "cleared: $base"
+          count=$((count + 1))
+          ;;
+      esac
+    done
+    echo "cleared $count watch(es)"
+    ;;
+  *)
+    target="$root/$1"
+    if [ ! -d "$target" ]; then
+      echo "watch-clear: no such watch id: $1" >&2
+      exit 1
+    fi
+    rm -rf "$target"
+    echo "cleared: $1"
+    ;;
+esac
