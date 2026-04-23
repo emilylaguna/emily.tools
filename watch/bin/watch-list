@@ -7,7 +7,9 @@
 #
 set -uo pipefail
 
-: "${CLAUDE_PLUGIN_DATA:?CLAUDE_PLUGIN_DATA not set}"
+# shellcheck source=../lib/env.sh
+source "$(dirname "$0")/../lib/env.sh"
+watch_ensure_plugin_data "$0"
 
 root="${CLAUDE_PLUGIN_DATA}/watches"
 if [ ! -d "$root" ]; then

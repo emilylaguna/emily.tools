@@ -33,10 +33,17 @@
 #   other          unexpected — logged, keeps watching
 #
 # Env:
-#   CLAUDE_PLUGIN_DATA   persistent plugin dir; state lives here
+#   CLAUDE_PLUGIN_DATA   persistent plugin dir; state lives here. Auto-
+#                        derived from the script's own location if not
+#                        already set (Monitor subprocess doesn't inherit
+#                        plugin env from the parent session).
 #   WATCH_ID             optional override for the identity hash
 #
 set -uo pipefail
+
+# shellcheck source=../lib/env.sh
+source "$(dirname "$0")/../lib/env.sh"
+watch_ensure_plugin_data "$0"
 
 if [ $# -lt 2 ]; then
   echo "usage: watch <child-cmd> <interval-seconds> [args...]" >&2
@@ -56,8 +63,6 @@ if ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
   echo "watch: interval must be a positive integer (seconds), got: $interval" >&2
   exit 64
 fi
-
-: "${CLAUDE_PLUGIN_DATA:?CLAUDE_PLUGIN_DATA not set — watch must run under a plugin runtime}"
 
 # Stable watch identity: hash of the child command + its args. Same
 # invocation shape → same state dir across sessions. User can override
