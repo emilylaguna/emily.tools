@@ -4,7 +4,7 @@
     "name": "Emily Laguna"
   },
   "description": "Emily's Tools",
-  "version": "0.1",
+  "version": "0.2",
   "plugins": [
     {
       "name": "emily",

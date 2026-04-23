@@ -1,0 +1,15 @@
+{
+  "description": "Hook to calculate the current context usage",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/check-context.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
