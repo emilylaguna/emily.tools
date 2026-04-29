@@ -2,9 +2,8 @@
 name: file
 description: Watch a single file for content changes. Trigger when the user asks to watch a file, know when a file changes, or be alerted on edits. Uses content hash — a bare `touch` without real edits will NOT fire.
 argument-hint: '<path> [every <seconds>]'
+allowed-tools: Bash, Monitor, TaskStop
 ---
-
-# /watch:file
 
 Poll a file and emit an event when its content hash changes.
 

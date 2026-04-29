@@ -4,8 +4,6 @@ description: Watch any shell command's output and fire when it changes. The esca
 argument-hint: '"<shell-command>" [every <seconds>]'
 ---
 
-# /watch:cmd
-
 Run a shell command on an interval, hash its stdout, and emit when the output changes. The generic primitive behind everything else.
 
 ## Collecting arguments

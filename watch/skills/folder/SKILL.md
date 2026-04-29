@@ -2,9 +2,8 @@
 name: folder
 description: Watch a folder recursively for file adds, modifications, and deletions. Trigger when the user asks to watch a directory, be notified about changes in a project folder, or track file-system activity. Uses mtime+size manifest; hidden files (.git, .DS_Store) skipped by default.
 argument-hint: '<path> [--glob "<pattern>"] [every <seconds>]'
+allowed-tools: Bash, Monitor, TaskStop
 ---
-
-# /watch:folder
 
 Maintain a manifest of files under a folder and emit events when files are added, modified, or deleted.
 

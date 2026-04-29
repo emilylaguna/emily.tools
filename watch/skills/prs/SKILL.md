@@ -4,8 +4,6 @@ description: Watch a GitHub repo for newly-opened PRs. Trigger when the user ask
 argument-hint: '<owner/repo> [every <seconds>]'
 ---
 
-# /watch:prs
-
 Poll a GitHub repo for newly-opened PRs and surface them to Charlie via the `Monitor` tool.
 
 ## Collecting arguments

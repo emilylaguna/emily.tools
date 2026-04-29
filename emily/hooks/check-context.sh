@@ -32,10 +32,10 @@ remaining_percent=$(awk "BEGIN { printf \"%.2f\", (${remaining} / ${max_context}
 
 remaining_int=${remaining_percent%.*}
 
-if (( remaining_int < 10 )); then
-    echo "Remaining context is CRITICALLY LOW (<10%)! You NEED to finish any in-flight work then insist on starting a new session before continuing"
-elif (( remaining_int < 30 )); then
-    echo "Remaining context is VERY LOW (<30%)! It's time to start wrapping up the session! Finish up in-flight work, and suggest starting a new session before starting any new work."
+if (( remaining_int < 40 )); then
+    echo "Remaining context is CRITICALLY LOW! You NEED to finish any in-flight work then insist on starting a new session before continuing"
+elif (( remaining_int < 60 )); then
+    echo "Remaining context is LOW! It's time to start wrapping up the session! Finish up in-flight work, save session, and suggest starting a new session before starting any new work."
 fi
 
 exit 0

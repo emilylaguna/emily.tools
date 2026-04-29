@@ -2,9 +2,8 @@
 name: pr
 description: Watch a specific GitHub PR for new comments, reviews, and CI check changes. Trigger when the user asks to watch/monitor/keep tabs on a PR, be notified about PR activity, or know when comments/reviews land. Scope is ONE PR — for a whole repo's PR list, use watch:prs instead.
 argument-hint: '<owner/repo>#<pr> [every <seconds>]'
+allowed-tools: Bash, Monitor, TaskStop
 ---
-
-# /watch:pr
 
 Monitor a single GitHub PR and surface new activity to Charlie via the `Monitor` tool.
 

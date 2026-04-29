@@ -2,9 +2,8 @@
 name: branch
 description: Watch a git branch (local or remote) for new commits. Trigger when the user asks to watch a branch, know when someone pushes to main, or track upstream changes. Fires one event per commit in chronological order.
 argument-hint: '<repo-path> <branch> [--remote <remote>]'
+allowed-tools: Bash, Monitor, TaskStop
 ---
-
-# /watch:branch
 
 Poll a git branch and emit one event per new commit.
 

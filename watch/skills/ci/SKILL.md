@@ -2,9 +2,8 @@
 name: ci
 description: Watch a GitHub Actions workflow run until it completes. Trigger when the user asks to watch a CI run, know when a build finishes, be alerted on workflow pass/fail, or babysit a deploy. Narrower than watch:pr — this tracks ONE run to completion.
 argument-hint: '<owner/repo> <run-id>  OR  <owner/repo> --branch <branch>'
+allowed-tools: Bash, Monitor, TaskStop
 ---
-
-# /watch:ci
 
 Poll a GitHub Actions workflow run until it reaches a terminal state, then emit the conclusion and stop.
 

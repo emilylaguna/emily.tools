@@ -4,8 +4,6 @@ description: Watch an HTTP or HTTPS URL for status code changes and body content
 argument-hint: '<url> [--status-only] [every <seconds>]'
 ---
 
-# /watch:url
-
 Poll a URL and emit events on status-code changes, body content changes, and reachability flips.
 
 ## Collecting arguments
