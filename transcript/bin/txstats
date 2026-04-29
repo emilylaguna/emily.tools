@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""
+txstats — canonical statistics for Claude Code JSONL transcripts.
+
+Usage:
+  txstats <path>              # path is a .jsonl file or a folder containing .jsonl files
+  txstats <path> --json       # machine-readable output
+  txstats <path> --top N      # change "top N" cutoff (default 15)
+  txstats <path> --turns      # also list per-turn token totals (top 10 most expensive)
+  txstats <path> --bash-bytes # also list per-tool result-byte totals
+
+The goal: replace the ~30 hand-authored jq pipelines that the analyzer
+otherwise writes per session. A single subprocess call returns the slate.
+
+Token math comes from .message.usage exactly. No estimation.
+
+Note on cache_read: every assistant turn's .message.usage.cache_read_input_tokens
+counts the entire cached context re-read on that call. Those tokens were created
+(and counted) in some earlier turn's cache_creation, so summing cache_read across
+turns inflates "total" by roughly context_size × number_of_calls. We surface two
+metrics:
+  - billed total: sum of all four fields (correct for billing — cache_read is
+    billed, just at a discount).
+  - new tokens : input + cache_creation + output (the unique work the session
+    actually did). Per-turn rankings use this so the top-10 isn't just
+    "every turn after context filled up."
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+
+def find_transcripts(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        return sorted(p for p in path.rglob("*.jsonl") if p.is_file())
+    sys.exit(f"txstats: not a file or directory: {path}")
+
+
+def iter_lines(p: Path):
+    with p.open("r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def analyze(paths: list[Path]) -> dict:
+    files: list[dict] = []
+    tool_use_counter: Counter = Counter()
+    read_files: Counter = Counter()
+    bash_first_word: Counter = Counter()
+    bash_full: Counter = Counter()
+    edit_files: Counter = Counter()
+    grep_patterns: Counter = Counter()
+    agent_subtypes: Counter = Counter()
+    type_counter: Counter = Counter()
+
+    bash_result_bytes: list[int] = []
+    bash_result_max = 0
+    result_bytes_by_tool: dict[str, list[int]] = defaultdict(list)
+    id_to_tool: dict[str, str] = {}
+
+    total_input = total_cache_create = total_cache_read = total_output = 0
+    # (new_tokens, cache_read, file) — new_tokens = input + cache_creation + output
+    # (excludes cache_read; that's the cached context re-read every call, not new
+    # work done this turn). Ranking by the all-inclusive total makes every late
+    # turn look ~identical at context-size.
+    per_turn_totals: list[tuple[int, int, str]] = []
+    redundant_reads_by_file: list[
+        tuple[Path, int, int]
+    ] = []  # (file, total_reads, redundant)
+    user_prompts: list[str] = []
+    cwds: set[str] = set()
+    branches: set[str] = set()
+    versions: set[str] = set()
+    first_ts = last_ts = None
+
+    text_only_assistant_chars = 0
+
+    for tp in paths:
+        per_file_reads: Counter = Counter()
+        n_lines = 0
+        for j in iter_lines(tp):
+            n_lines += 1
+            t = j.get("type")
+            type_counter[t or "?"] += 1
+            ts = j.get("timestamp")
+            if ts:
+                if first_ts is None or ts < first_ts:
+                    first_ts = ts
+                if last_ts is None or ts > last_ts:
+                    last_ts = ts
+            if c := j.get("cwd"):
+                cwds.add(c)
+            if b := j.get("gitBranch"):
+                branches.add(b)
+            if v := j.get("version"):
+                versions.add(v)
+
+            if t == "assistant":
+                msg = j.get("message", {}) or {}
+                usage = msg.get("usage") or {}
+                ti = usage.get("input_tokens") or 0
+                tcc = usage.get("cache_creation_input_tokens") or 0
+                tcr = usage.get("cache_read_input_tokens") or 0
+                to = usage.get("output_tokens") or 0
+                total_input += ti
+                total_cache_create += tcc
+                total_cache_read += tcr
+                total_output += to
+                # New tokens this turn: input + cache_creation + output.
+                # Cache_read tokens were created (and counted) in a prior turn's
+                # cache_creation; including them here would just rank turns by
+                # context size, which grows monotonically.
+                new_tokens = ti + tcc + to
+                if new_tokens or tcr:
+                    per_turn_totals.append((new_tokens, tcr, tp.name))
+
+                content = msg.get("content") or []
+                if isinstance(content, list):
+                    has_tool_use = False
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        bt = block.get("type")
+                        if bt == "tool_use":
+                            has_tool_use = True
+                            name = block.get("name") or "?"
+                            tool_use_counter[name] += 1
+                            tu_id = block.get("id")
+                            if tu_id:
+                                id_to_tool[tu_id] = name
+                            inp = block.get("input") or {}
+                            if name == "Read":
+                                fp = inp.get("file_path")
+                                if fp:
+                                    read_files[fp] += 1
+                                    per_file_reads[fp] += 1
+                            elif name == "Bash":
+                                cmd = (inp.get("command") or "").strip()
+                                fw = cmd.split(None, 1)[0] if cmd else ""
+
+                                if fw:
+                                    bash_first_word[fw] += 1
+                                # truncate to 120 chars for "top full" tally
+                                bash_full[
+                                    (cmd[:120] + ("…" if len(cmd) > 120 else ""))
+                                    or "<empty>"
+                                ] += 1
+                            elif name == "Edit":
+                                fp = inp.get("file_path")
+                                if fp:
+                                    edit_files[fp] += 1
+                            elif name == "Grep":
+                                pat = inp.get("pattern")
+                                if pat:
+                                    grep_patterns[pat] += 1
+                            elif name in ("Task", "Agent"):
+                                st = (
+                                    inp.get("subagent_type")
+                                    or inp.get("agent_type")
+                                    or "?"
+                                )
+                                agent_subtypes[st] += 1
+                        elif bt == "text":
+                            txt = block.get("text") or ""
+                            if isinstance(content, list) and not any(
+                                isinstance(b, dict) and b.get("type") == "tool_use"
+                                for b in content
+                            ):
+                                text_only_assistant_chars += len(txt)
+                                has_tool_use = False
+                    _ = has_tool_use
+
+            elif t == "user":
+                msg = j.get("message", {}) or {}
+                content = msg.get("content")
+                # Plain user prompts
+                if isinstance(content, str):
+                    s = content.strip()
+                    if s and not s.startswith("[") and not is_ignored(s):
+                        user_prompts.append(s[:200])
+
+                # Tool result sizes (use toolUseResult)
+                tur = j.get("toolUseResult")
+                if isinstance(tur, dict):
+                    stdout = tur.get("stdout")
+                    if isinstance(stdout, str):
+                        sz = len(stdout)
+                        bash_result_bytes.append(sz)
+                        if sz > bash_result_max:
+                            bash_result_max = sz
+                # Map tool_result blocks back to their tool by id
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "tool_result":
+                            tu_id = block.get("tool_use_id")
+                            inner = block.get("content")
+                            if isinstance(inner, list):
+                                size = sum(
+                                    len(b.get("text") or "")
+                                    for b in inner
+                                    if isinstance(b, dict)
+                                )
+                            elif isinstance(inner, str):
+                                size = len(inner)
+                            else:
+                                size = 0
+                            tool_name = id_to_tool.get(tu_id, "?")
+                            result_bytes_by_tool[tool_name].append(size)
+
+        # Redundant reads in this file
+        total_reads = sum(per_file_reads.values())
+        redundant = sum(c - 1 for c in per_file_reads.values() if c >= 2)
+        redundant_reads_by_file.append((tp, total_reads, redundant))
+
+        files.append(
+            {
+                "path": str(tp),
+                "lines": n_lines,
+                "size_bytes": tp.stat().st_size,
+            }
+        )
+
+    grand_total = total_input + total_cache_create + total_cache_read + total_output
+    # "New tokens" = unique tokens the session actually generated/processed.
+    # cache_read is excluded because every cache_read corresponds to tokens
+    # already counted in some earlier turn's cache_creation.
+    new_tokens_total = total_input + total_cache_create + total_output
+
+    return {
+        "files": files,
+        "first_timestamp": first_ts,
+        "last_timestamp": last_ts,
+        "cwds": sorted(cwds),
+        "branches": sorted(branches),
+        "versions": sorted(versions),
+        "type_counts": dict(type_counter.most_common()),
+        "tokens": {
+            "input": total_input,
+            "cache_creation": total_cache_create,
+            "cache_read": total_cache_read,
+            "output": total_output,
+            "total": grand_total,
+            "new_tokens": new_tokens_total,
+        },
+        "per_turn_top": sorted(per_turn_totals, reverse=True),
+        "tool_use_counts": dict(tool_use_counter.most_common()),
+        "top_read_files": read_files.most_common(),
+        "top_bash_first_words": bash_first_word.most_common(),
+        "top_bash_commands": bash_full.most_common(),
+        "top_edit_files": edit_files.most_common(),
+        "top_grep_patterns": grep_patterns.most_common(),
+        "agent_subtypes": dict(agent_subtypes.most_common()),
+        "redundant_reads_per_file": [
+            {"file": str(p), "total_reads": tr, "redundant": rd}
+            for p, tr, rd in redundant_reads_by_file
+        ],
+        "bash_result_size": {
+            "count": len(bash_result_bytes),
+            "total_bytes": sum(bash_result_bytes),
+            "avg_bytes": (sum(bash_result_bytes) // len(bash_result_bytes))
+            if bash_result_bytes
+            else 0,
+            "max_bytes": bash_result_max,
+        },
+        "result_bytes_by_tool": {
+            k: {
+                "calls": len(v),
+                "total_bytes": sum(v),
+                "avg_bytes": (sum(v) // len(v)) if v else 0,
+                "max_bytes": max(v) if v else 0,
+            }
+            for k, v in sorted(result_bytes_by_tool.items(), key=lambda kv: -sum(kv[1]))
+        },
+        "user_prompts": user_prompts,
+        "text_only_assistant_chars": text_only_assistant_chars,
+    }
+
+
+def render_text(
+    stats: dict, top_n: int, show_turns: bool, show_bash_bytes: bool
+) -> str:
+    out: list[str] = []
+    p = out.append
+
+    p("=== txstats ===")
+    p(f"transcripts: {len(stats['files'])}")
+    for f in stats["files"]:
+        p(f"  {f['path']}  ({f['lines']} lines, {f['size_bytes']} bytes)")
+    if stats["first_timestamp"] or stats["last_timestamp"]:
+        p(f"timespan: {stats['first_timestamp']} → {stats['last_timestamp']}")
+    if stats["cwds"]:
+        p(f"cwds: {', '.join(stats['cwds'])}")
+    if stats["branches"]:
+        p(f"branches: {', '.join(stats['branches'])}")
+    if stats["versions"]:
+        p(f"versions: {', '.join(stats['versions'])}")
+    p("")
+
+    tc = stats["type_counts"]
+    p("--- record type counts ---")
+    for k, v in tc.items():
+        p(f"  {k}: {v}")
+    p("")
+
+    tk = stats["tokens"]
+    p("--- token usage (.message.usage, exact) ---")
+    p(f"  input         : {tk['input']:>12,}")
+    p(f"  cache_creation: {tk['cache_creation']:>12,}")
+    p(f"  cache_read    : {tk['cache_read']:>12,}  (cached context re-read each call)")
+    p(f"  output        : {tk['output']:>12,}")
+    p(f"  billed total  : {tk['total']:>12,}  (sum of all four; what you pay for)")
+    p(
+        f"  new tokens    : {tk['new_tokens']:>12,}  "
+        "(input + cache_creation + output; unique work)"
+    )
+    if tk["total"]:
+        cr_pct = 100.0 * tk["cache_read"] / tk["total"]
+        p(f"  cache_read%   : {cr_pct:.1f}%")
+    p("")
+
+    p(f"--- tool-use frequency (top {top_n}) ---")
+    for name, n in list(stats["tool_use_counts"].items())[:top_n]:
+        p(f"  {n:>5}  {name}")
+    p("")
+
+    p(f"--- top read files (top {top_n}) ---")
+    for fp, n in stats["top_read_files"][:top_n]:
+        p(f"  {n:>5}  {fp}")
+    p("")
+
+    p(f"--- top edit files (top {top_n}) ---")
+    for fp, n in stats["top_edit_files"][:top_n]:
+        p(f"  {n:>5}  {fp}")
+    p("")
+
+    p(f"--- top bash first-words (top {top_n}) ---")
+    for fw, n in stats["top_bash_first_words"][:top_n]:
+        p(f"  {n:>5}  {fw}")
+    p("")
+
+    p(f"--- top bash commands [first 120 chars] (top {top_n}) ---")
+    for cmd, n in stats["top_bash_commands"][:top_n]:
+        p(f"  {n:>5}  {cmd}")
+    p("")
+
+    p(f"--- top  patterns (top {top_n}) ---")
+    for pat, n in stats["top_grep_patterns"][:top_n]:
+        p(f"  {n:>5}  {pat}")
+    p("")
+
+    if stats["agent_subtypes"]:
+        p("--- sub-agent invocations ---")
+        for st, n in stats["agent_subtypes"].items():
+            p(f"  {n:>5}  {st}")
+        p("")
+
+    p("--- redundant reads (same file ≥2× in a session) ---")
+    for entry in stats["redundant_reads_per_file"]:
+        p(
+            f"  {entry['redundant']:>5} redundant of {entry['total_reads']:>5} total — {entry['file']}"
+        )
+    p("")
+
+    bsr = stats["bash_result_size"]
+    p("--- bash tool-result sizes ---")
+    p(
+        f"  calls: {bsr['count']:,}  total: {bsr['total_bytes']:,} chars  avg: {bsr['avg_bytes']:,}  max: {bsr['max_bytes']:,}"
+    )
+    p("")
+
+    if show_bash_bytes:
+        p("--- result bytes by tool ---")
+        for name, m in stats["result_bytes_by_tool"].items():
+            p(
+                f"  {name:<14}  calls={m['calls']:>5}  total={m['total_bytes']:>10,}  avg={m['avg_bytes']:>7,}  max={m['max_bytes']:>7,}"
+            )
+        p("")
+
+    if show_turns:
+        p("--- top 10 most expensive assistant turns ---")
+        p("    (ranked by new tokens = input + cache_creation + output;")
+        p("     cache_read shown separately as context size at that turn)")
+        for new_tok, cache_read, fname in stats["per_turn_top"][:10]:
+            p(
+                f"  new={new_tok:>7,}  cache_read={cache_read:>8,}  {fname}"
+            )
+        p("")
+
+    if stats["user_prompts"]:
+        p(f"--- human user prompts ({len(stats['user_prompts'])}) ---")
+        for s in stats["user_prompts"][:10]:
+            p(f"  • {s}")
+        if len(stats["user_prompts"]) > 10:
+            p(f"  … +{len(stats['user_prompts']) - 10} more")
+        p("")
+
+    if stats["text_only_assistant_chars"]:
+        p(f"text-only assistant output: {stats['text_only_assistant_chars']:,} chars")
+
+    return "\n".join(out)
+
+
+def is_ignored(text: str) -> bool:
+    import re
+
+    if text.startswith("[Request interrupted"):
+        return True
+
+    # Slash commands
+    if re.match(r"^\/([\w-]+)(?:\s+(.*))?$", text):
+        return True
+
+    # XML tag messages: `<task-notification>...</task-notification>`
+    return bool(re.match(r"<\s*([\w-]+)[^>]*>([\s\S]*?)<\s*\/\s*\1\s*>", text))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="txstats", description=__doc__)
+    ap.add_argument("path", help="transcript .jsonl file or folder of jsonl files")
+    ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    ap.add_argument("--top", type=int, default=15, help="how many rows per top-N table")
+    ap.add_argument(
+        "--turns", action="store_true", help="include per-turn token totals (top 10)"
+    )
+    ap.add_argument(
+        "--bash-bytes", action="store_true", help="include result-byte totals per tool"
+    )
+    args = ap.parse_args()
+
+    transcripts = find_transcripts(Path(args.path))
+    if not transcripts:
+        sys.exit(f"txstats: no .jsonl files under {args.path}")
+
+    stats = analyze(transcripts)
+    if args.json:
+        json.dump(stats, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+    else:
+        print(render_text(stats, args.top, args.turns, args.bash_bytes))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

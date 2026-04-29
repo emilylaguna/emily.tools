@@ -13,6 +13,10 @@
     {
       "name": "watch",
       "source": "./watch"
+    },
+    {
+      "name": "transcript",
+      "source": "./transcript"
     }
   ]
 }
