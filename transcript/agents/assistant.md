@@ -31,13 +31,23 @@ The parent gives you:
 
    Banned: `Read <file>.jsonl` with no offset/limit. The parent's whole reason for delegating to you is to keep raw transcript bytes out of the main context.
 
-4. **Return findings as JSON** — exactly this shape — wrapped in a single fenced block at the end of your reply:
+4. **Always check cache health.** `txstats` now reports — by default — session cache-hit rate, cache invalidation events (turn-over-turn cache_read collapse + creation spike), top cache-creation turns, and 20-block lookback-risk turns. Treat these as first-class findings, not a footnote:
+
+   - Hit rate ≤ 0.6 → emit a `prefix_invalidation` finding.
+   - Any invalidation event → emit a finding naming the turn and the suspected invalidator (drill the user/system content between the two turns to confirm; see the "Cache-shaped recipes" section in `jq-recipes`).
+   - Any turn with > 20 tool_use blocks AND its successor turn's cache_read collapsed → emit a `lookback_miss` finding.
+   - Repeated sub-agent invocations of the same subagent_type with low cache_read on their child transcripts → emit a `subagent_prefix_waste` finding.
+
+   These four classes are *required* checks, not optional.
+
+5. **Return findings as JSON** — exactly this shape — wrapped in a single fenced block at the end of your reply:
 
    ```json
    {
      "txstats_summary": {
        "total_tokens": <int>,
        "cache_read_pct": <float>,
+       "cache_hit_rate": <float>,
        "tool_use_counts": { "<tool>": <int>, ... },
        "transcripts": <int>
      },
@@ -49,12 +59,20 @@ The parent gives you:
          "evidence": "<jq counts, turn ids, exact token numbers>",
          "frequency": "<N occurrences across M transcripts>",
          "estimated_savings_tokens": <int or null>,
-         "fix_class": "<cli|subagent|skill|prompt|hook|other>"
+         "fix_class": "<cli|subagent|skill|prompt|hook|other>",
+         "cache_impact": {
+           "type": "<invalidation|lookback_miss|subagent_prefix_waste|fanout_miss|below_breakpoint_bloat|none>",
+           "extra_cache_creation_tokens": <int or null>,
+           "lost_cache_read_tokens": <int or null>,
+           "details": "<one-sentence why this is cache-shaped, or omit if type=none>"
+         }
        }
      ],
      "open_questions": ["<questions only humans can answer>"]
    }
    ```
+
+   `cache_impact.type = "none"` is valid for purely tool-use-pattern findings; do not invent a cache angle that isn't there. But if the finding *is* cache-shaped, fill in the numbers — that's how the parent quantifies savings at 1.25× write vs. 0.1× read pricing.
 
    The parent will paste this verbatim into the proposal it builds for the user. Don't wrap it in commentary.
 

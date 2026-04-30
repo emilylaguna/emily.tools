@@ -24,6 +24,13 @@ metrics:
   - new tokens : input + cache_creation + output (the unique work the session
     actually did). Per-turn rankings use this so the top-10 isn't just
     "every turn after context filled up."
+
+Cache analysis (always on — half the wins in a transcript are cache-shaped):
+  - session cache-hit rate (≥0.85 = healthy; ≤0.6 = prefix invalidating)
+  - cache invalidation events (turn-over-turn cache_read collapse + creation spike)
+  - top cache-creation turns (where the cache-write premium was paid)
+  - 20-block-lookback risk (assistant turns with >20 tool_use blocks; the next
+    turn may silently miss the cache because its breakpoint walks back >20 blocks)
 """
 
 from __future__ import annotations
@@ -72,11 +79,10 @@ def analyze(paths: list[Path]) -> dict:
     id_to_tool: dict[str, str] = {}
 
     total_input = total_cache_create = total_cache_read = total_output = 0
-    # (new_tokens, cache_read, file) — new_tokens = input + cache_creation + output
-    # (excludes cache_read; that's the cached context re-read every call, not new
-    # work done this turn). Ranking by the all-inclusive total makes every late
-    # turn look ~identical at context-size.
-    per_turn_totals: list[tuple[int, int, str]] = []
+    # Rich per-turn record list (in transcript order, segmented by file for
+    # invalidation/lookback analysis). Each entry has all the usage fields plus
+    # the count of tool_use blocks in the assistant turn.
+    per_turn_records: list[dict] = []
     redundant_reads_by_file: list[
         tuple[Path, int, int]
     ] = []  # (file, total_reads, redundant)
@@ -124,10 +130,33 @@ def analyze(paths: list[Path]) -> dict:
                 # cache_creation; including them here would just rank turns by
                 # context size, which grows monotonically.
                 new_tokens = ti + tcc + to
-                if new_tokens or tcr:
-                    per_turn_totals.append((new_tokens, tcr, tp.name))
 
                 content = msg.get("content") or []
+                # Count tool_use blocks for 20-block lookback risk analysis.
+                n_tool_blocks = (
+                    sum(
+                        1
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "tool_use"
+                    )
+                    if isinstance(content, list)
+                    else 0
+                )
+
+                if new_tokens or tcr:
+                    per_turn_records.append(
+                        {
+                            "idx": len(per_turn_records),
+                            "file": tp.name,
+                            "input": ti,
+                            "cache_creation": tcc,
+                            "cache_read": tcr,
+                            "output": to,
+                            "new_tokens": new_tokens,
+                            "n_tool_blocks": n_tool_blocks,
+                        }
+                    )
+
                 if isinstance(content, list):
                     has_tool_use = False
                     for block in content:
@@ -241,6 +270,79 @@ def analyze(paths: list[Path]) -> dict:
     # already counted in some earlier turn's cache_creation.
     new_tokens_total = total_input + total_cache_create + total_output
 
+    # ---------------- cache analysis (always-on) -----------------------------
+    # Session cache-hit rate: cache_read / (cache_read + cache_creation + input).
+    # ≥0.85 healthy; ≤0.6 means prefix is being invalidated repeatedly.
+    cache_denom = total_cache_read + total_cache_create + total_input
+    cache_hit_rate = (total_cache_read / cache_denom) if cache_denom else 0.0
+
+    # Group records per file for sequence analysis (lookback / invalidation).
+    records_by_file: dict[str, list[dict]] = defaultdict(list)
+    for rec in per_turn_records:
+        records_by_file[rec["file"]].append(rec)
+
+    # Cache invalidation events: turn-over-turn cache_read drop ≥50% AND
+    # cache_creation spike ≥5,000. The diff between this turn's prompt and the
+    # previous turn's prompt is what broke the cache — typically a system change
+    # (CLAUDE.md edit, plugin/tool change, dynamic system-reminder content),
+    # a model switch, or a tool definition edit.
+    invalidation_events: list[dict] = []
+    for fname, recs in records_by_file.items():
+        for i in range(1, len(recs)):
+            prev, curr = recs[i - 1], recs[i]
+            if (
+                prev["cache_read"] >= 5_000
+                and curr["cache_read"] < prev["cache_read"] * 0.5
+                and curr["cache_creation"] >= 5_000
+            ):
+                drop_pct = (
+                    100.0 * (1 - curr["cache_read"] / prev["cache_read"])
+                    if prev["cache_read"]
+                    else 100.0
+                )
+                invalidation_events.append(
+                    {
+                        "file": fname,
+                        "turn_idx": curr["idx"],
+                        "prev_cache_read": prev["cache_read"],
+                        "curr_cache_read": curr["cache_read"],
+                        "curr_cache_creation": curr["cache_creation"],
+                        "drop_pct": round(drop_pct, 1),
+                    }
+                )
+
+    # Top cache-creation turns: where the 1.25× write premium was paid.
+    top_cache_creation_turns = sorted(
+        [r for r in per_turn_records if r["cache_creation"] > 0],
+        key=lambda r: -r["cache_creation"],
+    )[:10]
+
+    # 20-block lookback risk: assistant turns with >20 tool_use blocks. The
+    # *next* turn's breakpoint walks back at most 20 blocks searching for a
+    # prior cache write; if it walks past the previous breakpoint, it silently
+    # misses. We surface the next turn's cache_read so it's easy to confirm.
+    lookback_risk_turns: list[dict] = []
+    for fname, recs in records_by_file.items():
+        for i, rec in enumerate(recs):
+            if rec["n_tool_blocks"] > 20:
+                nxt = recs[i + 1] if i + 1 < len(recs) else None
+                lookback_risk_turns.append(
+                    {
+                        "file": fname,
+                        "turn_idx": rec["idx"],
+                        "n_tool_blocks": rec["n_tool_blocks"],
+                        "next_cache_read": nxt["cache_read"] if nxt else None,
+                        "next_cache_creation": nxt["cache_creation"] if nxt else None,
+                    }
+                )
+
+    # Backward-compat: the old (new_tokens, cache_read, file) tuple list used by
+    # the --turns rendering. Derived from records.
+    per_turn_top = sorted(
+        ((r["new_tokens"], r["cache_read"], r["file"]) for r in per_turn_records),
+        reverse=True,
+    )
+
     return {
         "files": files,
         "first_timestamp": first_ts,
@@ -257,7 +359,13 @@ def analyze(paths: list[Path]) -> dict:
             "total": grand_total,
             "new_tokens": new_tokens_total,
         },
-        "per_turn_top": sorted(per_turn_totals, reverse=True),
+        "cache_analysis": {
+            "hit_rate": cache_hit_rate,
+            "invalidation_events": invalidation_events,
+            "top_cache_creation_turns": top_cache_creation_turns,
+            "lookback_risk_turns": lookback_risk_turns,
+        },
+        "per_turn_top": per_turn_top,
         "tool_use_counts": dict(tool_use_counter.most_common()),
         "top_read_files": read_files.most_common(),
         "top_bash_first_words": bash_first_word.most_common(),
@@ -331,6 +439,98 @@ def render_text(
     if tk["total"]:
         cr_pct = 100.0 * tk["cache_read"] / tk["total"]
         p(f"  cache_read%   : {cr_pct:.1f}%")
+    p("")
+
+    # ---------------- cache analysis (always-on) -----------------------------
+    ca = stats["cache_analysis"]
+    p("--- cache health (read this section first) ---")
+    rate = ca["hit_rate"]
+    health = (
+        "healthy" if rate >= 0.85
+        else "ok" if rate >= 0.6
+        else "BLEEDING — prefix is being invalidated repeatedly"
+    )
+    p(f"  cache_hit_rate : {rate:.3f}  ({health})")
+    p(
+        "    formula: cache_read / (cache_read + cache_creation + input)."
+    )
+    p(
+        "    ≥0.85 healthy · 0.6–0.85 ok · ≤0.6 = prefix is bleeding "
+        "(find the invalidator)"
+    )
+    p("")
+
+    inv = ca["invalidation_events"]
+    p(f"--- cache invalidation events ({len(inv)}) ---")
+    p(
+        "    (turn-over-turn cache_read drop ≥50% with cache_creation ≥5k —"
+    )
+    p(
+        "     the diff vs. the previous turn is what broke the cache: typically"
+    )
+    p(
+        "     a CLAUDE.md edit, plugin/tool change, model switch, or dynamic"
+    )
+    p("     system-reminder content like a date or session id)")
+    if not inv:
+        p("    (none — prefix stable across the session)")
+    else:
+        for ev in inv[:top_n]:
+            p(
+                f"    turn {ev['turn_idx']:>5}  "
+                f"prev_read={ev['prev_cache_read']:>9,} → "
+                f"curr_read={ev['curr_cache_read']:>9,}  "
+                f"(drop {ev['drop_pct']:>5.1f}%)  "
+                f"curr_create={ev['curr_cache_creation']:>9,}  "
+                f"{ev['file']}"
+            )
+        if len(inv) > top_n:
+            p(f"    … +{len(inv) - top_n} more")
+    p("")
+
+    tcc = ca["top_cache_creation_turns"]
+    p(f"--- top cache-creation turns (where 1.25× cache-write premium was paid) ({len(tcc)}) ---")
+    if not tcc:
+        p("    (no cache writes recorded)")
+    else:
+        for r in tcc:
+            p(
+                f"    turn {r['idx']:>5}  "
+                f"create={r['cache_creation']:>9,}  "
+                f"read={r['cache_read']:>9,}  "
+                f"input={r['input']:>6,}  "
+                f"blocks={r['n_tool_blocks']:>3}  "
+                f"{r['file']}"
+            )
+    p("")
+
+    lb = ca["lookback_risk_turns"]
+    p(f"--- 20-block lookback risk turns ({len(lb)}) ---")
+    p(
+        "    (assistant turns with >20 tool_use blocks; the next turn's"
+    )
+    p(
+        "     breakpoint walks back ≤20 blocks looking for a prior cache write."
+    )
+    p(
+        "     If next_cache_read is ~0 with high next_cache_creation, the"
+    )
+    p("     lookback missed and the whole prefix was re-processed full price.)")
+    if not lb:
+        p("    (none — no turns exceeded the 20-block lookback window)")
+    else:
+        for r in lb[:top_n]:
+            ncr = r["next_cache_read"]
+            ncc = r["next_cache_creation"]
+            p(
+                f"    turn {r['turn_idx']:>5}  "
+                f"blocks={r['n_tool_blocks']:>3}  "
+                f"next_read={(f'{ncr:,}' if ncr is not None else '—'):>9}  "
+                f"next_create={(f'{ncc:,}' if ncc is not None else '—'):>9}  "
+                f"{r['file']}"
+            )
+        if len(lb) > top_n:
+            p(f"    … +{len(lb) - top_n} more")
     p("")
 
     p(f"--- tool-use frequency (top {top_n}) ---")
