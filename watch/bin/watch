@@ -33,17 +33,27 @@
 #   other          unexpected — logged, keeps watching
 #
 # Env:
-#   CLAUDE_PLUGIN_DATA   persistent plugin dir; state lives here. Auto-
-#                        derived from the script's own location if not
-#                        already set (Monitor subprocess doesn't inherit
-#                        plugin env from the parent session).
+#   WATCH_DATA_ROOT      state home (default ~/.emily/watch). Override to
+#                        relocate state, e.g. for tests.
 #   WATCH_ID             optional override for the identity hash
 #
 set -uo pipefail
 
+# Resolve our own bin/ dir (symlink-safe) so we can source lib/env.sh and
+# put sibling commands on PATH — this is what lets the harness run
+# standalone outside Claude, where the plugin doesn't manage PATH for us.
+src="${BASH_SOURCE[0]}"
+while [ -h "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$src")" && pwd)
+PATH="$SCRIPT_DIR:$PATH"
+
 # shellcheck source=../lib/env.sh
-source "$(dirname "$0")/../lib/env.sh"
-watch_ensure_plugin_data "$0"
+source "$SCRIPT_DIR/../lib/env.sh"
+watch_init_data_root
 
 if [ $# -lt 2 ]; then
   echo "usage: watch <child-cmd> <interval-seconds> [args...]" >&2
@@ -75,7 +85,7 @@ if [ -z "${WATCH_ID:-}" ]; then
   WATCH_ID="${child}-${hash}"
 fi
 
-state_dir="${CLAUDE_PLUGIN_DATA}/watches/${WATCH_ID}"
+state_dir="${WATCH_DATA_ROOT}/${WATCH_ID}"
 
 # Record cold-boot state BEFORE mkdir so children see the real signal.
 if [ -d "$state_dir" ]; then

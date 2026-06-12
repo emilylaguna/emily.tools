@@ -10,11 +10,20 @@
 #
 set -uo pipefail
 
-# shellcheck source=../lib/env.sh
-source "$(dirname "$0")/../lib/env.sh"
-watch_ensure_plugin_data "$0"
+# Resolve our own dir (symlink-safe) so sourcing works from any cwd / PATH.
+src="${BASH_SOURCE[0]}"
+while [ -h "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$src")" && pwd)
 
-root="${CLAUDE_PLUGIN_DATA}/watches"
+# shellcheck source=../lib/env.sh
+source "$SCRIPT_DIR/../lib/env.sh"
+watch_init_data_root
+
+root="${WATCH_DATA_ROOT}"
 
 if [ $# -lt 1 ]; then
   echo "usage: watch-clear <watch-id> | --all | --match <substr>" >&2
