@@ -1,6 +1,41 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "name": "emily",
   "description": "Emily's Tools",
   "author": {"name": "Emily Laguna" },
-  "version": "0.2"
+  "version": "0.3",
+  "userConfig": {
+    "low_threshold_200k": {
+      "type": "number",
+      "title": "200k Context Window: Low Warning",
+      "description": "Triggers the low context warning when the remaining context % is below this threshold. Default: 60",
+      "min": 10,
+      "max": 100,
+      "default": 60
+    },
+    "critical_threshold_200k": {
+      "type": "number",
+      "title": "200k Context Window: Critical Warning",
+      "description": "Triggers the critical context warning when the remaining context % is below this threshold. Default: 40",
+      "min": 10,
+      "max": 100,
+      "default": 40
+    },
+    "low_threshold_1m": {
+      "type": "number",
+      "title": "1m Context Window: Low Warning",
+      "description": "Triggers the low context warning when the remaining context % is below this threshold. Default: 60",
+      "min": 10,
+      "max": 100,
+      "default": 60
+    },
+    "critical_threshold_1m": {
+      "type": "number",
+      "title": "1m Context Window: Critical Warning",
+      "description": "Triggers the critical context warning when the remaining context % is below this threshold. Default: 40",
+      "min": 10,
+      "max": 100,
+      "default": 40
+    }
+  }
 }
