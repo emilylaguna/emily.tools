@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+
+show_help() {
+    cat <<'EOF'
+chat-messages - render a Claude Code transcript (JSONL) as readable messages
+
+Usage:
+  chat-messages [options] [FILE]
+  cat FILE | chat-messages [options]
+  tail -f FILE | chat-messages [options]
+
+Options:
+  -j, --json            Output messages as JSON (one object per line)
+  -md, --markdown       Output messages as Markdown
+  --raw                 Default mode: never markdown-render bodies (plain text)
+  -u, --user NAME       Display name for user messages (default: User)
+  -a, --assistant NAME  Display name for assistant messages (default: Assistant)
+  -h, --help            Show this help
+
+With no FILE, reads from stdin. Default output is colored terminal text; when
+stdout is a TTY and `mdcat` is installed, message bodies are markdown-rendered
+per message (works while tailing, unlike `--md | mdcat`). Use --raw to disable.
+EOF
+}
+
+hr() {
+    printf "$(tput dim)$(tput setaf 7)%.0s─" $(seq 1 "$(tput cols)") && tput sgr0
+}
+
+
+# Per-object transform: emit one {role,message,timestamp} per matching line,
+# or `empty` to skip. No map()/slurp, so jq streams line-by-line (tail -f).
+extract='
+def fmt_ts: split(".")[0] + "Z" | fromdateiso8601 | strftime("%m/%d/%Y %I:%M:%S %p");
+select(.message?.content != null)
+| (if (.message.content | type == "string") then
+       {role: "user", message: .message.content, timestamp}
+   elif (.message.content | type == "array") then
+       (.message.content | map(select(.type == "text" and .text != null)) | map(.text) | join("\n")) as $t
+       | if ($t | length) > 0 then {role: "assistant", message: $t, timestamp} else empty end
+   else empty end)
+'
+
+JSON=0
+MARKDOWN=0
+RAW=0
+
+USER_NAME="User"
+ASSISTANT_NAME="Assistant"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -j|--json)
+            JSON=1
+            MARKDOWN=0
+            shift 1
+            ;;
+        -md|--markdown|--md)
+            JSON=0
+            MARKDOWN=1
+            shift 1
+            ;;
+        -u|--user)
+            USER_NAME="$2"
+            shift 2
+            ;;
+        -a|--assistant)
+            ASSISTANT_NAME="$2"
+            shift 2
+            ;;
+        --raw)
+            RAW=1
+            shift 1
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: unknown option: $1" >&2
+            show_help >&2
+            exit 1
+            ;;
+        *)
+            TARGET="$1"
+            if [ -z "$TARGET" ]; then
+                show_help >&2
+                exit 1
+            fi
+
+            if ! [ -e "$TARGET" ]; then
+                echo "Error: path not found: $TARGET" >&2
+                exit 1
+            fi
+
+            shift
+            ;;
+    esac
+done
+
+TARGET="${TARGET:-/dev/stdin}"
+
+# Colored, compact header line: "[timestamp] Role".
+hdr='
+{ blue: "\u001b[94m", green: "\u001b[92m", bright_green: "\u001b[92m", reset: "\u001b[0m" } as $c
+| "\(if .role == "user" then $c.blue else $c.green end)[\(.timestamp | fmt_ts)] \(if .role == "user" then $user else $assistant end)\($c.reset)"
+'
+
+# Default (terminal) mode: render each message body as markdown via mdcat --
+# but only when stdout is a TTY, mdcat exists, and --raw was not passed. mdcat
+# buffers to EOF, so it can't wrap the whole `tail -f` stream at once; we run
+# it per message instead, keeping BOTH markdown rendering AND streaming.
+if [[ $JSON -eq 0 && $MARKDOWN -eq 0 && $RAW -eq 0 && -t 1 ]] && command -v mdcat >/dev/null 2>&1; then
+    # NUL-delimited records of "header<US>body"; jq -j + --unbuffered streams.
+    cat "$TARGET" \
+        | jq -j --unbuffered --arg user "$USER_NAME" --arg assistant "$ASSISTANT_NAME" "$extract | ($hdr) + \"\u001f\" + .message + \"\u0000\"" \
+        | while IFS= read -r -d '' rec; do
+            printf '%s\n' "${rec%%$'\x1f'*}"
+            printf '%s' "${rec#*$'\x1f'}" | mdcat
+            hr
+            printf '\n'
+        done
+    exit 0
+fi
+
+# Plain per-object formatter (no external renderer), selected by mode.
+if [[ $JSON -eq 1 ]]; then
+    fmt='tojson'
+elif [[ $MARKDOWN -eq 1 ]]; then
+    fmt='"\n\(if .role == "user" then $user else $assistant end) - \(.timestamp | fmt_ts)\n====\n\(.message)\n"'
+else
+    fmt='
+{ blue: "\u001b[34m", green: "\u001b[32m", gray: "\u001b[37m", reset: "\u001b[0m" } as $c
+| "\(if .role == "user" then $c.blue else $c.green end)[\(.timestamp | fmt_ts)] \(if .role == "user" then $user else $assistant end)\($c.reset)\($c.gray)\n\(.message)\($c.reset)\n"
+'
+fi
+
+# One long-lived jq; --unbuffered flushes per object so that
+# `tail -f FILE | chat-messages` prints messages as they are appended.
+cat "$TARGET" | jq -r --unbuffered --arg user "$USER_NAME" --arg assistant "$ASSISTANT_NAME" "$extract | ($fmt)"
