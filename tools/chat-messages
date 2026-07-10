@@ -23,30 +23,39 @@ per message (works while tailing, unlike `--md | mdcat`). Use --raw to disable.
 EOF
 }
 
-hr() {
-    printf "$(tput dim)$(tput setaf 7)%.0s─" $(seq 1 "$(tput cols)") && tput sgr0
-}
-
-
-# Per-object transform: emit one {role,message,timestamp} per matching line,
-# or `empty` to skip. No map()/slurp, so jq streams line-by-line (tail -f).
-extract='
-def fmt_ts: split(".")[0] + "Z" | fromdateiso8601 | strftime("%m/%d/%Y %I:%M:%S %p");
-select(.message?.content != null)
-| (if (.message.content | type == "string") then
-       {role: "user", message: .message.content, timestamp}
-   elif (.message.content | type == "array") then
-       (.message.content | map(select(.type == "text" and .text != null)) | map(.text) | join("\n")) as $t
-       | if ($t | length) > 0 then {role: "assistant", message: $t, timestamp} else empty end
-   else empty end)
-'
-
 JSON=0
+JSON_ARR=0
 MARKDOWN=0
 RAW=0
+LIMIT=1000
 
 USER_NAME="User"
 ASSISTANT_NAME="Assistant"
+
+transcript_file_path_from_session_id() {
+    local uuid_regex='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    input=${1:-}
+    if [ -z "$input" ]; then
+        input=$(cat)
+    fi
+
+    if [ -z "$input" ]; then
+        echo "$input"
+        return 1
+    fi
+    if [[ "$input" =~ $uuid_regex ]]; then
+        file=$(find ~/.claude/projects/ -name "$input.jsonl" | head -1)
+
+        if [ -s "$file" ]; then
+            echo "$file"
+            return 0
+        fi
+    fi
+
+    echo "$input"
+    return 1
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
@@ -55,6 +64,13 @@ while [[ $# -gt 0 ]]; do
             ;;
         -j|--json)
             JSON=1
+            JSON_ARR=0
+            MARKDOWN=0
+            shift 1
+            ;;
+        --json-array)
+            JSON=1
+            JSON_ARR=1
             MARKDOWN=0
             shift 1
             ;;
@@ -71,7 +87,11 @@ while [[ $# -gt 0 ]]; do
             ASSISTANT_NAME="$2"
             shift 2
             ;;
-        --raw)
+        -l|--limit)
+            LIMIT="$2"
+            shift 2
+            ;;
+        --plain)
             RAW=1
             shift 1
             ;;
@@ -90,7 +110,8 @@ while [[ $# -gt 0 ]]; do
                 show_help >&2
                 exit 1
             fi
-
+            
+            TARGET=$(transcript_file_path_from_session_id "$TARGET")
             if ! [ -e "$TARGET" ]; then
                 echo "Error: path not found: $TARGET" >&2
                 exit 1
@@ -103,41 +124,106 @@ done
 
 TARGET="${TARGET:-/dev/stdin}"
 
-# Colored, compact header line: "[timestamp] Role".
-hdr='
-{ blue: "\u001b[94m", green: "\u001b[92m", bright_green: "\u001b[92m", reset: "\u001b[0m" } as $c
-| "\(if .role == "user" then $c.blue else $c.green end)[\(.timestamp | fmt_ts)] \(if .role == "user" then $user else $assistant end)\($c.reset)"
+hr() {
+    printf "$(tput dim)$(tput setaf 7)%.0s─" $(seq 1 "$(tput cols)") && tput sgr0
+}
+
+# Per-object transform: emit one {role,message,timestamp} per matching line,
+# or `empty` to skip. No map()/slurp, so jq streams line-by-line (tail -f).
+# shellcheck disable=SC2016
+extract='
+    def fmt_ts: split(".")[0] + "Z" | fromdateiso8601 | strflocaltime("%m/%d/%Y %I:%M:%S %p");
+
+    # if this has already been processed by us, do nothing
+    if .role? != null then 
+        . 
+    else
+        # get messages with content
+        (
+            select(.message?.content != null) | 
+            (    
+                # if the message content is a string, this is a user message
+                if (.message.content | type == "string") then
+                    # usermessage format
+                    {role: $user, message: .message.content, timestamp: .timestamp | fmt_ts}
+                # if the messaged content is an array, it is most likely an assistant response
+                elif (.message.content | type == "array") then
+                    # create the base assistant return object
+                        {role: $assistant, timestamp: .timestamp | fmt_ts} + 
+                        (
+                        # take the array of content and filter just thinking and text entries
+                        .message.content | map(select(
+                            (.type == "text" and .text != null) or 
+                            (.type == "thinking" and .thinking != null) 
+                        ))
+                        | 
+                        # if message text
+                        (if map(select(.text != null)) | length > 0 then
+                            # build message object
+                            {"message": map(.text // "") | join("\n")}
+                        # else ifif thinking
+                        elif map(select(.thinking != null)) | length > 0 then
+                            #build thinking
+                            {"thinking": map(.thinking // "") | join("\n")}
+                        else null
+                        end)
+                        )
+                end
+            ) |
+            if (.message // .thinking != null) then . else empty end
+        )
+    end
 '
 
-# Default (terminal) mode: render each message body as markdown via mdcat --
-# but only when stdout is a TTY, mdcat exists, and --raw was not passed. mdcat
-# buffers to EOF, so it can't wrap the whole `tail -f` stream at once; we run
-# it per message instead, keeping BOTH markdown rendering AND streaming.
-if [[ $JSON -eq 0 && $MARKDOWN -eq 0 && $RAW -eq 0 && -t 1 ]] && command -v mdcat >/dev/null 2>&1; then
-    # NUL-delimited records of "header<US>body"; jq -j + --unbuffered streams.
-    cat "$TARGET" \
-        | jq -j --unbuffered --arg user "$USER_NAME" --arg assistant "$ASSISTANT_NAME" "$extract | ($hdr) + \"\u001f\" + .message + \"\u0000\"" \
+# Read the TARGET and check if it's a file path 
+read_input() {
+    output="$(cat "$TARGET" | transcript_file_path_from_session_id)"
+    ([ -s "$output" ] && cat "$output" || echo "$output")
+}
+
+render_ansi_color_view() {
+    # Colored, compact header line: "[timestamp] Role".
+    # shellcheck disable=SC2016
+    header='
+    { blue: "\u001b[94m", green: "\u001b[92m", bright_green: "\u001b[92m", reset: "\u001b[0m" } as $c
+    | "\(if .role == $user then $c.blue else $c.green end)[\(.timestamp)] \(.role)\($c.reset)"
+    '
+
+    read_input \
+        | jq -j --unbuffered --arg user "$USER_NAME" --arg assistant "$ASSISTANT_NAME" "$extract | ($header) + \"\u001f\" + \"> **\`Thinking\`** \(.thinking // empty)\" + \"\u001f\" + .message + \"\u0000\"" \
         | while IFS= read -r -d '' rec; do
             printf '%s\n' "${rec%%$'\x1f'*}"
-            printf '%s' "${rec#*$'\x1f'}" | mdcat
+            if command -v mdcat >/dev/null 2>&1; then
+                printf '%s' "${rec#*$'\x1f'}" | mdcat
+            else
+                printf '%s' "${rec#*$'\x1f'}"
+            fi
             hr
             printf '\n'
         done
-    exit 0
-fi
+}
 
 # Plain per-object formatter (no external renderer), selected by mode.
 if [[ $JSON -eq 1 ]]; then
     fmt='tojson'
-elif [[ $MARKDOWN -eq 1 ]]; then
-    fmt='"\n\(if .role == "user" then $user else $assistant end) - \(.timestamp | fmt_ts)\n====\n\(.message)\n"'
-else
-    fmt='
-{ blue: "\u001b[34m", green: "\u001b[32m", gray: "\u001b[37m", reset: "\u001b[0m" } as $c
-| "\(if .role == "user" then $c.blue else $c.green end)[\(.timestamp | fmt_ts)] \(if .role == "user" then $user else $assistant end)\($c.reset)\($c.gray)\n\(.message)\($c.reset)\n"
-'
+elif [[ $MARKDOWN -eq 1 ]]; then 
+    fmt='"\n\(.role) - \(.timestamp)\n====\n\(.message // "**Thinking:**\n > \(.thinking)")\n***"'
+elif [[ $RAW -eq 0 && -t 1  ]]; then 
+    # render each message body as markdown via mdcat --
+    # but only when stdout is a TTY, mdcat exists, and --raw was not passed. mdcat
+    # buffers to EOF, so it can't wrap the whole `tail -f` stream at once; we run
+    # it per message instead, keeping BOTH markdown rendering AND streaming.
+    render_ansi_color_view
+    exit 0
+else # Plain text
+    fmt='"[\(.timestamp)] \(.role) \(if .thinking != null then "Thoughts" else "Message" end)\n\(.message // .thinking)\n"'
 fi
 
 # One long-lived jq; --unbuffered flushes per object so that
 # `tail -f FILE | chat-messages` prints messages as they are appended.
-cat "$TARGET" | jq -r --unbuffered --arg user "$USER_NAME" --arg assistant "$ASSISTANT_NAME" "$extract | ($fmt)"
+output=$(read_input | jq -r --unbuffered --arg user "$USER_NAME" --arg assistant "$ASSISTANT_NAME" "$extract | ($fmt)")
+if [[ $JSON -eq 1 && $JSON_ARR -eq 1 ]]; then
+    echo "$output" | jq -src 
+else
+    echo "$output"
+fi
