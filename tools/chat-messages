@@ -6,10 +6,12 @@ chat-messages - render a Claude Code transcript (JSONL) as readable messages
 
 Usage:
   chat-messages [options] [FILE]
+  chat-messages                       # no FILE in a terminal -> interactive picker
   cat FILE | chat-messages [options]
   tail -f FILE | chat-messages [options]
 
 Options:
+  -p, --pick            Browse transcripts with an fzf picker, then render the pick
   -j, --json            Output messages as JSON (one object per line)
   -md, --markdown       Output messages as Markdown
   --raw                 Default mode: never markdown-render bodies (plain text)
@@ -17,9 +19,14 @@ Options:
   -a, --assistant NAME  Display name for assistant messages (default: Assistant)
   -h, --help            Show this help
 
-With no FILE, reads from stdin. Default output is colored terminal text; when
-stdout is a TTY and `mdcat` is installed, message bodies are markdown-rendered
-per message (works while tailing, unlike `--md | mdcat`). Use --raw to disable.
+FILE may be a transcript path or a bare Claude session UUID (resolved under
+~/.claude/projects). With no FILE and an interactive terminal, an fzf picker
+lists every transcript newest-first so you can fuzzy-search and preview one;
+force it anywhere with --pick. Piping into stdin bypasses the picker.
+
+Default output is colored terminal text; when stdout is a TTY and `mdcat` is
+installed, message bodies are markdown-rendered per message (works while
+tailing, unlike `--md | mdcat`). Use --raw to disable.
 EOF
 }
 
@@ -56,11 +63,92 @@ transcript_file_path_from_session_id() {
     return 1
 }
 
+# Turn an encoded project directory name into a short, human label.
+# Claude stores transcripts under ~/.claude/projects/<dir>, where <dir> is the
+# project's absolute path with every "/" rewritten to "-". That rewrite is not
+# reversible (real dashes in names are indistinguishable), so we do not try to
+# reconstruct the path — we just drop the "-Users-<login>-" home prefix and keep
+# the trailing few segments, which is what actually identifies the project.
+project_label_from_dir() {
+    local dir="$1"
+    dir="${dir#-}"                       # leading dash from the leading slash
+    dir="${dir#Users-}"                  # /Users
+    dir="${dir#"$(id -un)"-}"            # the login name segment
+    # Collapse to the last three segments so long paths stay readable.
+    awk -F- '{ n=NF; s=(n>3?n-2:1); out=""; for(i=s;i<=n;i++) out=out (out==""?"":"/") $i; print out }' <<<"$dir"
+}
+
+# Emit one fzf row per transcript. A row is "<display>\t<path>": fzf shows and
+# searches the display half (via --with-nth=1) and we recover the path from the
+# tab-delimited tail on accept. Rows are streamed in caller order so fzf renders
+# them immediately instead of blocking on a full scan of every file.
+transcript_rows() {
+    local f dir proj sess mtime summary
+    while IFS= read -r f; do
+        [ -s "$f" ] || continue
+        dir=$(basename "$(dirname "$f")")
+        proj=$(project_label_from_dir "$dir")
+        sess=$(basename "$f" .jsonl)
+        # %m is epoch seconds on BSD/macOS stat; format it locally for display.
+        mtime=$(stat -f '%Sm' -t '%m/%d %H:%M' "$f" 2>/dev/null)
+        # First human-authored user text: skip slash-command/caveat/reminder
+        # envelopes (all wrapped in "<...>") and blank turns. Reading only the
+        # head keeps this fast across hundreds of multi-megabyte transcripts.
+        summary=$(head -n 60 "$f" 2>/dev/null | jq -r '
+            select(.type=="user")
+            | .message.content
+            | (if type=="string" then . else ([.[]? | select(.type=="text") | .text] | join(" ")) end)
+            | select(. != null and (ltrimstr(" ") | startswith("<") | not))
+            | gsub("\\s+"; " ") | ltrimstr(" ")
+            | select(length > 0)
+        ' 2>/dev/null | head -n 1)
+        summary=${summary:0:200}
+        [ -n "$summary" ] || summary="(no user text)"
+        printf '%s  %-24s  %s  %s\t%s\n' "$mtime" "$proj" "${sess:0:8}" "$summary" "$f"
+    done
+}
+
+# Interactive transcript chooser. Prints the selected transcript path on stdout
+# and returns non-zero when fzf is unavailable or the user cancels, so callers
+# can exit quietly. The preview pane renders the highlighted transcript through
+# this very script (--plain for speed: no per-message mdcat pass).
+pick_transcript() {
+    if ! command -v fzf >/dev/null 2>&1; then
+        echo "Error: --pick needs fzf (brew install fzf)" >&2
+        return 2
+    fi
+    local self selected
+    self=$(command -v chat-messages || echo "$0")
+    # Newest-first: stat every transcript once, sort by epoch mtime descending,
+    # then hand the ordered paths to the row generator. fzf preserves input order.
+    selected=$(
+        find "$HOME/.claude/projects/" -name '*.jsonl' -type f 2>/dev/null \
+            | while IFS= read -r f; do stat -f '%m %N' "$f" 2>/dev/null; done \
+            | sort -rn | cut -d' ' -f2- \
+            | transcript_rows \
+            | fzf --ansi --delimiter=$'\t' --with-nth=1 \
+                  --no-hscroll --layout=reverse --border \
+                  --prompt='transcript> ' \
+                  --header='enter: render   ctrl-/: toggle preview' \
+                  --preview="$self --plain {2}" \
+                  --preview-window='right,55%,wrap' \
+                  --bind='ctrl-/:toggle-preview'
+    )
+    [ -n "$selected" ] || return 1          # user cancelled (Esc / Ctrl-C)
+    printf '%s\n' "${selected##*$'\t'}"
+}
+
+PICK=0
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
             show_help
             exit 0
+            ;;
+        -p|--pick)
+            PICK=1
+            shift 1
             ;;
         -j|--json)
             JSON=1
@@ -121,6 +209,21 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Launch the picker when asked (--pick), or by default when there is no FILE and
+# stdin is an interactive terminal — i.e. bare `chat-messages` in a shell. When
+# stdin is a pipe (no TTY) we fall through to reading it, preserving the
+# `cat FILE | chat-messages` and `tail -f` workflows.
+if [[ $PICK -eq 1 ]] || { [ -z "${TARGET:-}" ] && [ -t 0 ]; }; then
+    TARGET=$(pick_transcript)
+    pick_rc=$?
+    # 1 = user cancelled (quiet exit 0), 2 = fzf missing (its own error already
+    # printed). Anything non-zero means "no selection": stop before rendering.
+    if [ $pick_rc -ne 0 ]; then
+        [ $pick_rc -eq 1 ] && exit 0
+        exit $pick_rc
+    fi
+fi
 
 TARGET="${TARGET:-/dev/stdin}"
 
